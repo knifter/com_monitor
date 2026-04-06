@@ -1,0 +1,27 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install pyserial pywin32 pyinstaller
+
+      - name: Build exe
+        run: pyinstaller --onefile --windowed --name com_monitor monitor.py
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/com_monitor.exe
