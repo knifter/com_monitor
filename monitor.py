@@ -99,7 +99,7 @@ def save_settings(s: dict) -> None:
 
 
 # ── flash curve  ─────────────────────────────────────────────────────────────
-def _flash_brightness(t: float) -> float:
+def _flash_brightness(t: float, k: float = FLASH_DECAY_K) -> float:
     """
     0..1 flash intensity at t seconds after port appeared.
 
@@ -111,7 +111,7 @@ def _flash_brightness(t: float) -> float:
         return 0.0
     if t < FLASH_ATTACK_S:
         return t / FLASH_ATTACK_S          # quick linear ramp to 1.0
-    return math.exp(-FLASH_DECAY_K * math.sqrt(t - FLASH_ATTACK_S))
+    return math.exp(-k * math.sqrt(t - FLASH_ATTACK_S))
 
 
 def _blend(c1: str, c2: str, t: float) -> str:
@@ -161,7 +161,7 @@ class ComMonitor(tk.Tk):
         self.settings = load_settings()
 
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", self.settings["always_on_top"])
         self.attributes("-alpha", ALPHA_OPAQUE)
         self.configure(bg=C_BG)
 
@@ -171,6 +171,12 @@ class ComMonitor(tk.Tk):
         self._row_widgets: list[list[tk.Widget]] = []
         self._drag_ox = self._drag_oy = 0
         self._dimmed  = False
+
+        # AOT timeout + auto-pin state
+        self._known_ports: set[str] = set()
+        self._last_change = time.time()
+        self._topmost_active = self.settings["always_on_top"]
+        self._flash_decay_k = self._compute_flash_decay_k()
 
         self._build_ui()
         self._refresh()
@@ -246,6 +252,11 @@ class ComMonitor(tk.Tk):
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
 
+    # ── settings ──────────────────────────────────────────────────────────────
+    def _compute_flash_decay_k(self) -> float:
+        # Solve exp(-K * sqrt(d - attack)) = 0.1 → K = 2.3 / sqrt(d - attack)
+        d = max(self.settings["highlight_duration_s"] - FLASH_ATTACK_S, 0.1)
+        return 2.3 / math.sqrt(d)
     def _apply_settings(self):
         """Re-apply settings to derived state after they've been edited."""
         self._flash_decay_k  = self._compute_flash_decay_k()
@@ -276,6 +287,21 @@ class ComMonitor(tk.Tk):
                 if self._initialized:           # don't flash ports seen at startup
                     # shift back so first render lands at peak brightness, not t=0
                     self._flash_start[p.device] = now - FLASH_ATTACK_S
+
+        # AOT timeout: re-enable on port change, drop after idle period
+        if self._initialized and current != self._known_ports:
+            self._last_change = now
+            if self.settings["always_on_top"] and not self._topmost_active:
+                self.attributes("-topmost", True)
+                self._topmost_active = True
+        self._known_ports = current
+
+        if self.settings["always_on_top"] and self._topmost_active:
+            timeout = self.settings["always_on_top_timeout_s"]
+            if timeout > 0 and (now - self._last_change) > timeout:
+                self.attributes("-topmost", False)
+                self._topmost_active = False
+
         self._initialized = True
 
         # rebuild rows
@@ -307,7 +333,7 @@ class ComMonitor(tk.Tk):
                 # flash envelope
                 flash_t = now - self._flash_start[p.device] if p.device in self._flash_start else None
                 if flash_t is not None:
-                    brightness = _flash_brightness(flash_t)
+                    brightness = _flash_brightness(flash_t, self._flash_decay_k)
                     row_bg     = _blend(C_ROW_FLASH, C_BG, 1.0 - brightness)
                     row_font   = FONT_BOLD if brightness > BOLD_THRESHOLD else FONT
                 else:
