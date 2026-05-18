@@ -1,0 +1,11 @@
+[project]
+name = "com-monitor"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "pyinstaller>=6.20.0",
+    "pyserial>=3.5",
+    "pywin32>=311",
+]
