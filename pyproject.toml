@@ -1,11 +1,15 @@
 [project]
 name = "com-monitor"
 version = "0.1.0"
-description = "Add your description here"
+description = "USB COM Port Monitor — small always-on-top desktop widget"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
-    "pyinstaller>=6.20.0",
     "pyserial>=3.5",
-    "pywin32>=311",
+    "pywin32>=311 ; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = [
+    "pyinstaller>=6.20.0",
 ]
