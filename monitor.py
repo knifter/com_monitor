@@ -10,6 +10,8 @@ Needs:  pip install pyserial pywin32
 import tkinter as tk
 import math
 import time
+import json
+import os
 
 try:
     import serial.tools.list_ports
@@ -62,6 +64,38 @@ COLS = [
     ("Serial / Loc",  "w", False),
     ("Description",   "w", True),
 ]
+
+# ── settings ──────────────────────────────────────────────────────────────────
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "settings.json")
+
+DEFAULT_SETTINGS = {
+    "highlight_duration_s":     20.0,         # effective row-flash fade time
+    "always_on_top":            True,
+    "always_on_top_timeout_s":  120,          # 0 = stay on top forever
+    "window_position":          "top-right",  # top-left|top-right|bottom-left|bottom-right
+}
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return dict(DEFAULT_SETTINGS)
+    merged = dict(DEFAULT_SETTINGS)
+    for k, v in data.items():
+        if k in DEFAULT_SETTINGS:
+            merged[k] = v
+    return merged
+
+
+def save_settings(s: dict) -> None:
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except Exception as e:
+        print(f"Failed to save settings: {e}")
 
 
 # ── flash curve  ─────────────────────────────────────────────────────────────
@@ -124,6 +158,8 @@ def is_open(device: str) -> bool:
 class ComMonitor(tk.Tk):
     def __init__(self):
         super().__init__()
+        self.settings = load_settings()
+
         self.overrideredirect(True)
         self.attributes("-topmost", True)
         self.attributes("-alpha", ALPHA_OPAQUE)
@@ -160,6 +196,11 @@ class ComMonitor(tk.Tk):
             activebackground=C_HDR, activeforeground="#aaaaaa",
             command=self._toggle_dim)
         self._dim_btn.pack(side=tk.RIGHT)
+
+        tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0, relief="flat",
+                  font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="#aaaaaa",
+                  command=self._open_settings).pack(side=tk.RIGHT)
 
         self._grid = tk.Frame(self, bg=C_BG)
         self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
@@ -204,6 +245,19 @@ class ComMonitor(tk.Tk):
         if m < 60:   return f"{m}m{s:02d}s"
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
+
+    def _apply_settings(self):
+        """Re-apply settings to derived state after they've been edited."""
+        self._flash_decay_k  = self._compute_flash_decay_k()
+        self.attributes("-topmost", self.settings["always_on_top"])
+        self._topmost_active = self.settings["always_on_top"]
+        self._last_change    = time.time()
+        self._user_moved     = False         # explicit corner choice overrides drag
+        self._last_size      = (0, 0)
+        self._apply_window_position()
+
+    def _open_settings(self):
+        SettingsDialog(self)
 
     # ── refresh ───────────────────────────────────────────────────────────────
     def _refresh(self):
@@ -284,6 +338,113 @@ class ComMonitor(tk.Tk):
                 self._row_widgets.append(row_w)
 
         self.after(REFRESH_MS, self._refresh)
+
+
+# ── settings dialog ───────────────────────────────────────────────────────────
+class SettingsDialog(tk.Toplevel):
+    def __init__(self, parent: ComMonitor):
+        super().__init__(parent)
+        self.parent = parent
+        self.title("Settings")
+        self.configure(bg=C_BG)
+        self.transient(parent)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+
+        self._build()
+
+        self.update_idletasks()
+        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
+        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        self.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+        self.grab_set()
+        self.bind("<Escape>", lambda _: self.destroy())
+
+    def _build(self):
+        s   = self.parent.settings
+        pad = dict(padx=8, pady=4)
+
+        frm = tk.Frame(self, bg=C_BG)
+        frm.pack(fill=tk.BOTH, expand=True, padx=12, pady=(12, 6))
+
+        # Row highlight duration
+        tk.Label(frm, text="Row highlight duration (s):",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=0, column=0, sticky="w", **pad)
+        self.var_hl = tk.DoubleVar(value=s["highlight_duration_s"])
+        tk.Spinbox(frm, from_=1, to=600, increment=1, textvariable=self.var_hl,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=0, column=1, sticky="w", **pad)
+
+        # Always on top
+        self.var_aot = tk.BooleanVar(value=s["always_on_top"])
+        tk.Checkbutton(frm, text="Always on top",
+                       variable=self.var_aot,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+
+        # AOT idle timeout
+        tk.Label(frm, text="     ↳ drop after idle (s, 0 = never):",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=2, column=0, sticky="w", **pad)
+        self.var_to = tk.IntVar(value=s["always_on_top_timeout_s"])
+        tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_to,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=2, column=1, sticky="w", **pad)
+
+        # Window position
+        tk.Label(frm, text="Window position:",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=3, column=0, sticky="w", **pad)
+        self.var_pos = tk.StringVar(value=s["window_position"])
+        pos_frame = tk.Frame(frm, bg=C_BG)
+        pos_frame.grid(row=3, column=1, sticky="w", **pad)
+        for val, lbl in [("top-left", "TL"), ("top-right", "TR"),
+                         ("bottom-left", "BL"), ("bottom-right", "BR")]:
+            tk.Radiobutton(pos_frame, text=lbl, variable=self.var_pos, value=val,
+                           bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                           activebackground=C_BG, activeforeground=C_DESC,
+                           font=FONT, indicatoron=False, width=3,
+                           padx=4, pady=2, bd=1
+                           ).pack(side=tk.LEFT, padx=2)
+
+        # Buttons
+        btns = tk.Frame(self, bg=C_BG)
+        btns.pack(fill=tk.X, padx=12, pady=(6, 12))
+        tk.Button(btns, text="Cancel", command=self.destroy,
+                  bg=C_HDR, fg=C_DESC, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white",
+                  padx=14, pady=3).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(btns, text="Save", command=self._save,
+                  bg=C_HDR, fg=C_PORT, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white",
+                  padx=14, pady=3).pack(side=tk.RIGHT)
+
+    def _save(self):
+        s = self.parent.settings
+        try:
+            v = float(self.var_hl.get())
+            if v > 0:
+                s["highlight_duration_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        s["always_on_top"] = bool(self.var_aot.get())
+        try:
+            v = int(self.var_to.get())
+            if v >= 0:
+                s["always_on_top_timeout_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        s["window_position"] = self.var_pos.get()
+        save_settings(s)
+        self.parent._apply_settings()
+        self.destroy()
 
 
 if __name__ == "__main__":
