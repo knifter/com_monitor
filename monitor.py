@@ -47,13 +47,18 @@ C_AGE    = "#666666"
 C_DESC   = "#999999"
 C_HEAD   = "#444444"
 C_SER    = "#b0a0d0"
+C_ROW_GONE = "#7a1a1a"   # red peak for vanished-port row flash
+C_GONE     = "#a04848"   # foreground for "gone" status
+C_DIM      = "#555555"   # darkened text for vanished ports
 
 FONT      = ("Consolas", 10)
 FONT_BOLD = ("Consolas", 10, "bold")
 FONT_HDR  = ("Consolas", 9, "bold")
 
-ALPHA_OPAQUE = 0.96
-ALPHA_DIM    = 0.35
+ALPHA_OPAQUE   = 0.96
+ALPHA_DIM      = 0.35
+ALPHA_FADE_MIN = 0.05    # alpha when fade-to-transparent has fully run
+FADE_RAMP_S    = 3.0     # seconds to ramp a fade once its threshold is past
 
 COLS = [
     ("Port",          "w", False),
@@ -70,10 +75,18 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "settings.json")
 
 DEFAULT_SETTINGS = {
-    "highlight_duration_s":     20.0,         # effective row-flash fade time
-    "always_on_top":            True,
-    "always_on_top_timeout_s":  120,          # 0 = stay on top forever
-    "window_position":          "top-right",  # top-left|top-right|bottom-left|bottom-right
+    "highlight_duration_s":          20.0,    # effective row-flash fade time
+    "always_on_top":                 True,
+    "always_on_top_timeout_s":       120,     # 0 = stay on top forever
+    "show_removed_s":                60,      # 0 = don't show removed ports at all
+    "move_to_back_enable":           False,   # push window to back of Z-order on idle
+    "move_to_back_timeout_s":        300,
+    "fade_to_transparent_enable":    False,   # reduce window alpha on idle
+    "fade_to_transparent_timeout_s": 600,
+    "normal_alpha":                  ALPHA_OPAQUE,    # window opacity at rest
+    "faded_alpha":                   ALPHA_FADE_MIN,  # target opacity when fully faded
+    "window_x":                      None,    # last-known position; None = let WM place
+    "window_y":                      None,
 }
 
 
@@ -162,24 +175,28 @@ class ComMonitor(tk.Tk):
 
         self.overrideredirect(True)
         self.attributes("-topmost", self.settings["always_on_top"])
-        self.attributes("-alpha", ALPHA_OPAQUE)
+        self.attributes("-alpha", self.settings["normal_alpha"])
         self.configure(bg=C_BG)
 
-        self._first_seen:  dict[str, float] = {}   # device → first-seen time
-        self._flash_start: dict[str, float] = {}   # device → flash start time (new arrivals only)
-        self._initialized  = False                 # skip flash for ports present at startup
+        self._first_seen:     dict[str, float] = {}   # device → first-seen time
+        self._flash_start:    dict[str, float] = {}   # device → flash start time (new arrivals only)
+        self._disappeared_at: dict[str, float] = {}   # device → time it vanished
+        self._port_info:      dict[str, dict]  = {}   # device → last-known port info
+        self._initialized  = False                    # skip flash for ports present at startup
         self._row_widgets: list[list[tk.Widget]] = []
         self._drag_ox = self._drag_oy = 0
         self._dimmed  = False
 
-        # AOT timeout + auto-pin state
+        # AOT / push-to-back state
         self._known_ports: set[str] = set()
         self._last_change = time.time()
         self._topmost_active = self.settings["always_on_top"]
+        self._bg_active      = False
         self._flash_decay_k = self._compute_flash_decay_k()
 
         self._build_ui()
         self._refresh()
+        self._restore_window_position()
 
     # ── layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -228,11 +245,40 @@ class ComMonitor(tk.Tk):
         self.bind("<Escape>",    lambda _: self.destroy())
         self.bind("<Control-q>", lambda _: self.destroy())
 
+        # interaction wakes the window from any idle fade / push-to-back
+        self.bind("<Button>",  self._wake)
+        self.bind("<Enter>",   self._wake)
+        self.bind("<FocusIn>", self._wake)
+
     # ── transparency toggle ───────────────────────────────────────────────────
     def _toggle_dim(self):
         self._dimmed = not self._dimmed
-        self.attributes("-alpha", ALPHA_DIM if self._dimmed else ALPHA_OPAQUE)
         self._dim_btn.config(fg="#aaaaaa" if self._dimmed else "#666666")
+        self._update_alpha()
+
+    def _update_alpha(self):
+        normal = self.settings.get("normal_alpha", ALPHA_OPAQUE)
+        faded  = self.settings.get("faded_alpha",  ALPHA_FADE_MIN)
+        base = ALPHA_DIM if self._dimmed else normal
+        f = 0.0
+        if self.settings.get("fade_to_transparent_enable"):
+            threshold = self.settings["fade_to_transparent_timeout_s"]
+            idle = time.time() - self._last_change
+            if idle > threshold:
+                f = min(1.0, (idle - threshold) / FADE_RAMP_S)
+        target = base - (base - faded) * f
+        self.attributes("-alpha", target)
+
+    def _wake(self, _event=None):
+        """Restart the idle timeout — pull the window out of any fade or push-to-back."""
+        self._last_change = time.time()
+        if self.settings["always_on_top"] and not self._topmost_active:
+            self.attributes("-topmost", True)
+            self._topmost_active = True
+        if self._bg_active:
+            self.lift()
+            self._bg_active = False
+        self._update_alpha()
 
     # ── drag ─────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
@@ -257,15 +303,39 @@ class ComMonitor(tk.Tk):
         # Solve exp(-K * sqrt(d - attack)) = 0.1 → K = 2.3 / sqrt(d - attack)
         d = max(self.settings["highlight_duration_s"] - FLASH_ATTACK_S, 0.1)
         return 2.3 / math.sqrt(d)
+
+    def _restore_window_position(self):
+        x = self.settings.get("window_x")
+        y = self.settings.get("window_y")
+        if x is None or y is None:
+            return
+        self.update_idletasks()
+        # clamp to current virtual screen so a saved off-screen pos is recoverable
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        x = max(0, min(int(x), sw - 50))
+        y = max(0, min(int(y), sh - 50))
+        self.geometry(f"+{x}+{y}")
+
+    def _save_window_position(self):
+        try:
+            self.settings["window_x"] = self.winfo_x()
+            self.settings["window_y"] = self.winfo_y()
+            save_settings(self.settings)
+        except Exception:
+            pass
+
+    def destroy(self):
+        self._save_window_position()
+        super().destroy()
+
     def _apply_settings(self):
         """Re-apply settings to derived state after they've been edited."""
         self._flash_decay_k  = self._compute_flash_decay_k()
         self.attributes("-topmost", self.settings["always_on_top"])
         self._topmost_active = self.settings["always_on_top"]
         self._last_change    = time.time()
-        self._user_moved     = False         # explicit corner choice overrides drag
-        self._last_size      = (0, 0)
-        self._apply_window_position()
+        self._update_alpha()
 
     def _open_settings(self):
         SettingsDialog(self)
@@ -275,18 +345,44 @@ class ComMonitor(tk.Tk):
         now   = time.time()
         ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
 
-        # update registries
+        # update registries — active ports
         current = {p.device for p in ports}
-        for dev in list(self._first_seen):
-            if dev not in current:
-                del self._first_seen[dev]
-                self._flash_start.pop(dev, None)
         for p in ports:
+            self._port_info[p.device] = {
+                "vid": p.vid, "pid": p.pid,
+                "description":   p.description or "",
+                "serial_number": p.serial_number or "",
+                "location":      p.location or "",
+            }
             if p.device not in self._first_seen:
                 self._first_seen[p.device] = now
                 if self._initialized:           # don't flash ports seen at startup
                     # shift back so first render lands at peak brightness, not t=0
                     self._flash_start[p.device] = now - FLASH_ATTACK_S
+            if p.device in self._disappeared_at:
+                # port came back — clear gone marker and re-flash as a new arrival
+                del self._disappeared_at[p.device]
+                self._flash_start[p.device] = now - FLASH_ATTACK_S
+
+        # mark newly-vanished ports (skip if user has disabled the feature)
+        if self.settings["show_removed_s"] > 0:
+            for dev in list(self._first_seen):
+                if dev not in current and dev not in self._disappeared_at:
+                    self._disappeared_at[dev] = now
+                    self._flash_start.pop(dev, None)
+
+        # expire vanished ports past the configured display duration
+        show_removed = self.settings["show_removed_s"]
+        for dev, t in list(self._disappeared_at.items()):
+            if show_removed == 0 or (now - t) > show_removed:
+                del self._disappeared_at[dev]
+
+        # purge registries for devices that are neither active nor displayed-as-gone
+        for dev in list(self._first_seen):
+            if dev not in current and dev not in self._disappeared_at:
+                self._first_seen.pop(dev, None)
+                self._flash_start.pop(dev, None)
+                self._port_info.pop(dev, None)
 
         # AOT timeout: re-enable on port change, drop after idle period
         if self._initialized and current != self._known_ports:
@@ -302,6 +398,25 @@ class ComMonitor(tk.Tk):
                 self.attributes("-topmost", False)
                 self._topmost_active = False
 
+        # idle fades: window alpha
+        self._update_alpha()
+
+        # push-to-back on idle (opposite of always-on-top)
+        desired_back = False
+        if self.settings.get("move_to_back_enable"):
+            threshold = self.settings["move_to_back_timeout_s"]
+            if threshold > 0 and (now - self._last_change) > threshold:
+                desired_back = True
+        if desired_back:
+            if self._topmost_active:
+                self.attributes("-topmost", False)
+                self._topmost_active = False
+            self.lower()                   # keep re-lowering so newly opened windows pass us
+            self._bg_active = True
+        elif self._bg_active:
+            self.lift()
+            self._bg_active = False
+
         self._initialized = True
 
         # rebuild rows
@@ -311,49 +426,68 @@ class ComMonitor(tk.Tk):
         self._row_widgets.clear()
         self._empty_lbl.grid_forget()
 
-        if not ports:
+        rendered = sorted(set(current) | set(self._disappeared_at))
+        if not rendered:
             self._empty_lbl.grid(row=2, column=0, columnspan=len(COLS),
                                  sticky="w", pady=6)
         else:
-            for i, p in enumerate(ports):
-                age_s    = now - self._first_seen[p.device]
-                occupied = is_open(p.device)
+            for i, dev in enumerate(rendered):
+                gone = dev in self._disappeared_at
+                info = self._port_info.get(dev, {})
 
-                vid = f"{p.vid:04X}" if p.vid is not None else "----"
-                pid = f"{p.pid:04X}" if p.pid is not None else "----"
+                vid = f"{info.get('vid'):04X}" if info.get("vid") is not None else "----"
+                pid = f"{info.get('pid'):04X}" if info.get("pid") is not None else "----"
 
-                serial_no = p.serial_number or ""
-                location  = p.location      or ""
-                ser_loc   = " / ".join(filter(None, [serial_no, location])) or "—"
-
-                desc = p.description or ""
-                if desc == p.device:
+                ser_loc = " / ".join(filter(None, [info.get("serial_number", ""),
+                                                   info.get("location", "")])) or "—"
+                desc = info.get("description", "")
+                if desc == dev:
                     desc = ""
 
-                # flash envelope
-                flash_t = now - self._flash_start[p.device] if p.device in self._flash_start else None
-                if flash_t is not None:
-                    brightness = _flash_brightness(flash_t, self._flash_decay_k)
-                    row_bg     = _blend(C_ROW_FLASH, C_BG, 1.0 - brightness)
-                    row_font   = FONT_BOLD if brightness > BOLD_THRESHOLD else FONT
+                if gone:
+                    age_s      = now - self._disappeared_at[dev]
+                    brightness = _flash_brightness(age_s, self._flash_decay_k)
+                    row_bg     = _blend(C_ROW_GONE, C_BG, 1.0 - brightness)
+                    row_font   = FONT
+                    dot_c      = C_GONE
+                    age_c      = C_DIM
+                    stat_t     = "gone"
+                    stat_c     = C_GONE
+                    port_c     = C_DIM
+                    vid_c      = C_DIM
+                    ser_c      = C_DIM
+                    desc_c     = C_DIM
                 else:
-                    row_bg   = C_BG
-                    row_font = FONT
+                    age_s    = now - self._first_seen[dev]
+                    occupied = is_open(dev)
 
-                fresh  = age_s < NEW_DOT_S
-                dot_c  = C_NEW if fresh else (C_OPEN if occupied else C_FREE)
-                age_c  = C_NEW if fresh else C_AGE
-                stat_t = "OPEN" if occupied else "free"
-                stat_c = C_OPEN if occupied else C_FREE
+                    flash_t = now - self._flash_start[dev] if dev in self._flash_start else None
+                    if flash_t is not None:
+                        brightness = _flash_brightness(flash_t, self._flash_decay_k)
+                        row_bg     = _blend(C_ROW_FLASH, C_BG, 1.0 - brightness)
+                        row_font   = FONT_BOLD if brightness > BOLD_THRESHOLD else FONT
+                    else:
+                        row_bg   = C_BG
+                        row_font = FONT
+
+                    fresh  = age_s < NEW_DOT_S
+                    dot_c  = C_NEW if fresh else (C_OPEN if occupied else C_FREE)
+                    age_c  = C_NEW if fresh else C_AGE
+                    stat_t = "OPEN" if occupied else "free"
+                    stat_c = C_OPEN if occupied else C_FREE
+                    port_c = C_PORT
+                    vid_c  = C_VIDPID
+                    ser_c  = C_SER
+                    desc_c = C_DESC
 
                 cells = [
-                    dict(text=p.device,              fg=C_PORT,   anchor="w"),
-                    dict(text=f"{vid}:{pid}",         fg=C_VIDPID, anchor="w"),
-                    dict(text=self._age_str(age_s),   fg=age_c,    anchor="e"),
-                    dict(text="●",                    fg=dot_c,    anchor="center"),
-                    dict(text=stat_t,                 fg=stat_c,   anchor="w"),
-                    dict(text=ser_loc,                fg=C_SER,    anchor="w"),
-                    dict(text=desc,                   fg=C_DESC,   anchor="w"),
+                    dict(text=dev,                    fg=port_c, anchor="w"),
+                    dict(text=f"{vid}:{pid}",         fg=vid_c,  anchor="w"),
+                    dict(text=self._age_str(age_s),   fg=age_c,  anchor="e"),
+                    dict(text="●",                    fg=dot_c,  anchor="center"),
+                    dict(text=stat_t,                 fg=stat_c, anchor="w"),
+                    dict(text=ser_loc,                fg=ser_c,  anchor="w"),
+                    dict(text=desc,                   fg=desc_c, anchor="w"),
                 ]
                 row_w = []
                 for c, kw in enumerate(cells):
@@ -377,14 +511,28 @@ class SettingsDialog(tk.Toplevel):
         self.resizable(False, False)
         self.attributes("-topmost", True)
 
+        # snapshot for revert-on-cancel (live-preview sliders mutate parent.settings)
+        self._snapshot = dict(parent.settings)
+        self._saved    = False
+
         self._build()
 
         self.update_idletasks()
-        px = parent.winfo_rootx() + (parent.winfo_width()  - self.winfo_width())  // 2
-        py = parent.winfo_rooty() + (parent.winfo_height() - self.winfo_height()) // 2
+        dw, dh = self.winfo_width(), self.winfo_height()
+        # bias halfway between parent-centered and screen-centered so the dialog
+        # drifts toward the middle when the parent is parked in a corner
+        parent_cx = parent.winfo_rootx() + parent.winfo_width()  // 2
+        parent_cy = parent.winfo_rooty() + parent.winfo_height() // 2
+        screen_cx = self.winfo_screenwidth()  // 2
+        screen_cy = self.winfo_screenheight() // 2
+        cx = (parent_cx + screen_cx) // 2
+        cy = (parent_cy + screen_cy) // 2
+        px = cx - dw // 2
+        py = cy - dh // 2
         self.geometry(f"+{max(px, 0)}+{max(py, 0)}")
         self.grab_set()
-        self.bind("<Escape>", lambda _: self.destroy())
+        self.bind("<Escape>", lambda _: self._cancel())
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
 
     def _build(self):
         s   = self.parent.settings
@@ -404,6 +552,17 @@ class SettingsDialog(tk.Toplevel):
                    insertbackground=C_PORT
                    ).grid(row=0, column=1, sticky="w", **pad)
 
+        # Show removed ports for
+        tk.Label(frm, text="Show removed ports for (s, 0 = hide):",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=1, column=0, sticky="w", **pad)
+        self.var_sr = tk.IntVar(value=s["show_removed_s"])
+        tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_sr,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=1, column=1, sticky="w", **pad)
+
         # Always on top
         self.var_aot = tk.BooleanVar(value=s["always_on_top"])
         tk.Checkbutton(frm, text="Always on top",
@@ -411,39 +570,84 @@ class SettingsDialog(tk.Toplevel):
                        bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
                        activebackground=C_BG, activeforeground=C_DESC,
                        font=FONT, anchor="w"
-                       ).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+                       ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
 
         # AOT idle timeout
         tk.Label(frm, text="     ↳ drop after idle (s, 0 = never):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=2, column=0, sticky="w", **pad)
+                 ).grid(row=3, column=0, sticky="w", **pad)
         self.var_to = tk.IntVar(value=s["always_on_top_timeout_s"])
         tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_to,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=2, column=1, sticky="w", **pad)
+                   ).grid(row=3, column=1, sticky="w", **pad)
 
-        # Window position
-        tk.Label(frm, text="Window position:",
+        # Move window to back on idle
+        self.var_mtb = tk.BooleanVar(value=s["move_to_back_enable"])
+        tk.Checkbutton(frm, text="Move to background on idle",
+                       variable=self.var_mtb,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+        tk.Label(frm, text="     ↳ after (s):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=3, column=0, sticky="w", **pad)
-        self.var_pos = tk.StringVar(value=s["window_position"])
-        pos_frame = tk.Frame(frm, bg=C_BG)
-        pos_frame.grid(row=3, column=1, sticky="w", **pad)
-        for val, lbl in [("top-left", "TL"), ("top-right", "TR"),
-                         ("bottom-left", "BL"), ("bottom-right", "BR")]:
-            tk.Radiobutton(pos_frame, text=lbl, variable=self.var_pos, value=val,
-                           bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
-                           activebackground=C_BG, activeforeground=C_DESC,
-                           font=FONT, indicatoron=False, width=3,
-                           padx=4, pady=2, bd=1
-                           ).pack(side=tk.LEFT, padx=2)
+                 ).grid(row=5, column=0, sticky="w", **pad)
+        self.var_mtb_to = tk.IntVar(value=s["move_to_back_timeout_s"])
+        tk.Spinbox(frm, from_=1, to=86400, increment=10, textvariable=self.var_mtb_to,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=5, column=1, sticky="w", **pad)
+
+        # Fade to transparent on idle
+        self.var_ftr = tk.BooleanVar(value=s["fade_to_transparent_enable"])
+        tk.Checkbutton(frm, text="Fade window to transparent on idle",
+                       variable=self.var_ftr,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
+        tk.Label(frm, text="     ↳ after (s):",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=7, column=0, sticky="w", **pad)
+        self.var_ftr_to = tk.IntVar(value=s["fade_to_transparent_timeout_s"])
+        tk.Spinbox(frm, from_=1, to=86400, increment=10, textvariable=self.var_ftr_to,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=7, column=1, sticky="w", **pad)
+
+        # Normal / faded transparency sliders (live preview via _preview_alpha)
+        tk.Label(frm, text="Normal transparency:",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=8, column=0, sticky="w", **pad)
+        self.var_an = tk.DoubleVar(value=s["normal_alpha"])
+        tk.Scale(frm, from_=0.10, to=1.0, resolution=0.01,
+                 orient=tk.HORIZONTAL, variable=self.var_an,
+                 command=lambda v: self._preview_alpha("normal_alpha", v),
+                 bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
+                 highlightthickness=0, bd=0, length=160,
+                 font=FONT, activebackground=C_PORT,
+                 ).grid(row=8, column=1, sticky="w", **pad)
+
+        tk.Label(frm, text="Faded transparency:",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=9, column=0, sticky="w", **pad)
+        self.var_af = tk.DoubleVar(value=s["faded_alpha"])
+        tk.Scale(frm, from_=0.0, to=1.0, resolution=0.01,
+                 orient=tk.HORIZONTAL, variable=self.var_af,
+                 command=lambda v: self._preview_alpha("faded_alpha", v),
+                 bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
+                 highlightthickness=0, bd=0, length=160,
+                 font=FONT, activebackground=C_PORT,
+                 ).grid(row=9, column=1, sticky="w", **pad)
 
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(6, 12))
-        tk.Button(btns, text="Cancel", command=self.destroy,
+        tk.Button(btns, text="Cancel", command=self._cancel,
                   bg=C_HDR, fg=C_DESC, bd=0, relief="flat", font=FONT,
                   activebackground=C_HDR, activeforeground="white",
                   padx=14, pady=3).pack(side=tk.RIGHT, padx=(6, 0))
@@ -451,6 +655,20 @@ class SettingsDialog(tk.Toplevel):
                   bg=C_HDR, fg=C_PORT, bd=0, relief="flat", font=FONT,
                   activebackground=C_HDR, activeforeground="white",
                   padx=14, pady=3).pack(side=tk.RIGHT)
+
+    def _preview_alpha(self, key: str, val):
+        try:
+            self.parent.settings[key] = float(val)
+        except (TypeError, ValueError):
+            return
+        self.parent._update_alpha()
+
+    def _cancel(self):
+        if not self._saved:
+            self.parent.settings.clear()
+            self.parent.settings.update(self._snapshot)
+            self.parent._update_alpha()
+        self.destroy()
 
     def _save(self):
         s = self.parent.settings
@@ -467,9 +685,37 @@ class SettingsDialog(tk.Toplevel):
                 s["always_on_top_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
-        s["window_position"] = self.var_pos.get()
+        try:
+            v = int(self.var_sr.get())
+            if v >= 0:
+                s["show_removed_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        s["move_to_back_enable"] = bool(self.var_mtb.get())
+        try:
+            v = int(self.var_mtb_to.get())
+            if v > 0:
+                s["move_to_back_timeout_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        s["fade_to_transparent_enable"] = bool(self.var_ftr.get())
+        try:
+            v = int(self.var_ftr_to.get())
+            if v > 0:
+                s["fade_to_transparent_timeout_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        try:
+            s["normal_alpha"] = float(self.var_an.get())
+        except (tk.TclError, ValueError):
+            pass
+        try:
+            s["faded_alpha"] = float(self.var_af.get())
+        except (tk.TclError, ValueError):
+            pass
         save_settings(s)
         self.parent._apply_settings()
+        self._saved = True
         self.destroy()
 
 
