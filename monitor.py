@@ -57,7 +57,8 @@ FONT_BOLD = ("Consolas", 10, "bold")
 FONT_HDR  = ("Consolas", 9, "bold")
 
 ALPHA_OPAQUE = 0.96
-FADE_RAMP_S  = 0.6       # seconds to ramp from normal alpha to row alpha
+FADE_RAMP_S  = 2.5       # seconds for chrome text to fade into its background
+FADE_TICK_MS = 40        # animation tick while the fade ramp is running
 
 COLS = [
     ("Port",          "w", False),
@@ -81,8 +82,7 @@ DEFAULT_SETTINGS = {
     "interaction_timeout_s":    2,            # seconds with no mouse/focus before fading
     "move_to_back_enable":      False,        # push window to back of Z-order on idle
     "move_to_back_timeout_s":   300,
-    "normal_alpha":             ALPHA_OPAQUE, # window opacity while interactive
-    "row_alpha":                0.85,         # opacity for rows once chrome is hidden
+    "normal_alpha":             ALPHA_OPAQUE, # window opacity (rows keep this)
     "window_x":                 None,         # last-known position
     "window_y":                 None,
 }
@@ -192,43 +192,45 @@ class ComMonitor(tk.Tk):
         self._bg_active        = False
         self._colorkey_active  = False
         self._chrome_saved_text: dict = {}
+        self._last_fade_f      = -1.0
         self._flash_decay_k = self._compute_flash_decay_k()
 
         self._build_ui()
         self._refresh()
+        self._animate_fade()
         self._restore_window_position()
 
     # ── layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # widgets whose bg should drop out together with the window bg
-        # while the float-rows colorkey is active
-        self._chrome_widgets: list[tuple[tk.Widget, str]] = []
+        # (widget, normal_bg, normal_fg|None) — fg lerps toward bg during the
+        # ramp; bg snaps to the colorkey color at f=1.0
+        self._chrome_widgets: list[tuple[tk.Widget, str, str | None]] = []
 
         bar = tk.Frame(self, bg=C_HDR, cursor="fleur")
         bar.pack(fill=tk.X)
         bar.bind("<ButtonPress-1>", self._drag_start)
         bar.bind("<B1-Motion>",     self._drag_move)
-        self._chrome_widgets.append((bar, C_HDR))
+        self._chrome_widgets.append((bar, C_HDR, None))
 
         title_lbl = tk.Label(bar, text="  USB COM Monitor",
                              bg=C_HDR, fg="#666666", font=("Segoe UI", 8),
                              pady=4)
         title_lbl.pack(side=tk.LEFT)
-        self._chrome_widgets.append((title_lbl, C_HDR))
+        self._chrome_widgets.append((title_lbl, C_HDR, "#666666"))
 
         close_btn = tk.Button(bar, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
                               relief="flat", font=("Segoe UI", 8),
                               activebackground="#c0392b", activeforeground="white",
                               command=self.destroy)
         close_btn.pack(side=tk.RIGHT)
-        self._chrome_widgets.append((close_btn, C_HDR))
+        self._chrome_widgets.append((close_btn, C_HDR, "#666666"))
 
         gear_btn = tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
                              relief="flat", font=("Segoe UI", 8),
                              activebackground=C_HDR, activeforeground="#aaaaaa",
                              command=self._open_settings)
         gear_btn.pack(side=tk.RIGHT)
-        self._chrome_widgets.append((gear_btn, C_HDR))
+        self._chrome_widgets.append((gear_btn, C_HDR, "#666666"))
 
         self._grid = tk.Frame(self, bg=C_BG)
         self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
@@ -237,14 +239,14 @@ class ComMonitor(tk.Tk):
             col_hdr = tk.Label(self._grid, text=name, bg=C_BG, fg=C_HEAD,
                                font=FONT_HDR, anchor=anchor, padx=3)
             col_hdr.grid(row=0, column=c, sticky="ew")
-            self._chrome_widgets.append((col_hdr, C_BG))
+            self._chrome_widgets.append((col_hdr, C_BG, C_HEAD))
             if stretch:
                 self._grid.columnconfigure(c, weight=1)
 
         divider = tk.Frame(self._grid, bg="#333333", height=1)
         divider.grid(row=1, column=0, columnspan=len(COLS),
                      sticky="ew", pady=(1, 3))
-        self._chrome_widgets.append((divider, "#333333"))
+        self._chrome_widgets.append((divider, "#333333", None))
 
         self._empty_lbl = tk.Label(
             self._grid, text="(no COM ports detected)",
@@ -263,19 +265,30 @@ class ComMonitor(tk.Tk):
     # ── transparency ──────────────────────────────────────────────────────────
     def _update_alpha(self):
         normal = self.settings.get("normal_alpha", ALPHA_OPAQUE)
-        row    = self.settings.get("row_alpha",    ALPHA_OPAQUE)
+        self.attributes("-alpha", normal)
         threshold = self.settings["interaction_timeout_s"]
         idle = time.time() - self._last_interaction
         if idle > threshold:
             f = min(1.0, (idle - threshold) / FADE_RAMP_S)
         else:
             f = 0.0
-        # Smoothly fade the whole window from `normal` toward `row` over the
-        # ramp. At full fade snap the colorkey on so window chrome drops out
-        # and only the rows remain at their `row` alpha.
-        target = normal - (normal - row) * f
-        self.attributes("-alpha", target)
-        self._set_colorkey(f >= 1.0)
+        if f == self._last_fade_f:
+            return                           # nothing changed since last tick
+        self._last_fade_f = f
+        # Chrome text crossfades into its own background as f goes 0→1; at
+        # f=1.0 the colorkey snaps on and the (now empty-looking) chrome
+        # background becomes truly transparent.
+        if f < 1.0:
+            self._set_colorkey(False)
+            for w, normal_bg, normal_fg in self._chrome_widgets:
+                if normal_fg is None:
+                    continue
+                try:
+                    w.configure(fg=_blend(normal_fg, normal_bg, f))
+                except tk.TclError:
+                    pass
+        else:
+            self._set_colorkey(True)
 
     def _set_colorkey(self, on: bool):
         if on == self._colorkey_active:
@@ -287,7 +300,7 @@ class ComMonitor(tk.Tk):
         root_bg = C_TRANS_KEY if on else C_BG
         self.configure(bg=root_bg)
         self._grid.configure(bg=root_bg)
-        for w, normal_bg in self._chrome_widgets:
+        for w, normal_bg, normal_fg in self._chrome_widgets:
             w.configure(bg=C_TRANS_KEY if on else normal_bg)
             # also blank out text/icons — setting fg to the key still leaves
             # ClearType-rendered glyph pixels visible on Windows.
@@ -295,11 +308,18 @@ class ComMonitor(tk.Tk):
                 if on:
                     self._chrome_saved_text[w] = w.cget("text")
                     w.configure(text="")
-                elif w in self._chrome_saved_text:
-                    w.configure(text=self._chrome_saved_text.pop(w))
+                else:
+                    if w in self._chrome_saved_text:
+                        w.configure(text=self._chrome_saved_text.pop(w))
+                    if normal_fg is not None:
+                        w.configure(fg=normal_fg)
             except tk.TclError:
                 pass
         self._colorkey_active = on
+
+    def _animate_fade(self):
+        self._update_alpha()
+        self.after(FADE_TICK_MS, self._animate_fade)
 
     def _on_interact(self, _event=None):
         """Immediate wake — restart the interaction timer and restore visibility."""
@@ -658,8 +678,8 @@ class SettingsDialog(tk.Toplevel):
                    insertbackground=C_PORT
                    ).grid(row=6, column=1, sticky="w", **pad)
 
-        # Normal / row transparency sliders (live preview)
-        tk.Label(frm, text="Normal transparency:",
+        # Window transparency (rows keep this opacity; live preview)
+        tk.Label(frm, text="Window transparency:",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
                  ).grid(row=7, column=0, sticky="w", **pad)
         self.var_an = tk.DoubleVar(value=s["normal_alpha"])
@@ -670,18 +690,6 @@ class SettingsDialog(tk.Toplevel):
                  highlightthickness=0, bd=0, length=160,
                  font=FONT, activebackground=C_PORT,
                  ).grid(row=7, column=1, sticky="w", **pad)
-
-        tk.Label(frm, text="Row transparency when faded:",
-                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=8, column=0, sticky="w", **pad)
-        self.var_ar = tk.DoubleVar(value=s["row_alpha"])
-        tk.Scale(frm, from_=0.1, to=1.0, resolution=0.01,
-                 orient=tk.HORIZONTAL, variable=self.var_ar,
-                 command=lambda v: self._preview_alpha("row_alpha", v),
-                 bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
-                 highlightthickness=0, bd=0, length=160,
-                 font=FONT, activebackground=C_PORT,
-                 ).grid(row=8, column=1, sticky="w", **pad)
 
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
@@ -745,10 +753,6 @@ class SettingsDialog(tk.Toplevel):
             pass
         try:
             s["normal_alpha"] = float(self.var_an.get())
-        except (tk.TclError, ValueError):
-            pass
-        try:
-            s["row_alpha"] = float(self.var_ar.get())
         except (tk.TclError, ValueError):
             pass
         save_settings(s)
