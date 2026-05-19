@@ -229,7 +229,7 @@ class ComMonitor(tk.Tk):
                   command=self._open_settings).pack(side=tk.RIGHT)
 
         self._hdr_grid = tk.Frame(self, bg=C_BG)
-        self._hdr_grid.pack(fill=tk.X, padx=6, pady=(3, 0))
+        self._hdr_grid.pack(fill=tk.X, padx=2, pady=(3, 0))
 
         for c, (name, anchor, stretch) in enumerate(COLS):
             tk.Label(self._hdr_grid, text=name, bg=C_BG, fg=C_HEAD,
@@ -251,7 +251,7 @@ class ComMonitor(tk.Tk):
         self._rows_win.attributes("-alpha",   self.settings["normal_alpha"])
 
         self._grid = tk.Frame(self._rows_win, bg=C_BG)
-        self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        self._grid.pack(fill=tk.BOTH, expand=True, padx=2, pady=(0, 2))
 
         for c, (_, _, stretch) in enumerate(COLS):
             if stretch:
