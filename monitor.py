@@ -50,15 +50,14 @@ C_SER    = "#b0a0d0"
 C_ROW_GONE = "#7a1a1a"   # red peak for vanished-port row flash
 C_GONE     = "#a04848"   # foreground for "gone" status
 C_DIM      = "#555555"   # darkened text for vanished ports
+C_TRANS_KEY = "#FF00FF"  # color used as Windows "transparentcolor" key — never drawn
 
 FONT      = ("Consolas", 10)
 FONT_BOLD = ("Consolas", 10, "bold")
 FONT_HDR  = ("Consolas", 9, "bold")
 
-ALPHA_OPAQUE   = 0.96
-ALPHA_DIM      = 0.35
-ALPHA_FADE_MIN = 0.05    # alpha when fade-to-transparent has fully run
-FADE_RAMP_S    = 3.0     # seconds to ramp a fade once its threshold is past
+ALPHA_OPAQUE = 0.96
+FADE_RAMP_S  = 0.6       # seconds to ramp from normal alpha to row alpha
 
 COLS = [
     ("Port",          "w", False),
@@ -75,18 +74,17 @@ SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                              "settings.json")
 
 DEFAULT_SETTINGS = {
-    "highlight_duration_s":          20.0,    # effective row-flash fade time
-    "always_on_top":                 True,
-    "always_on_top_timeout_s":       120,     # 0 = stay on top forever
-    "show_removed_s":                60,      # 0 = don't show removed ports at all
-    "move_to_back_enable":           False,   # push window to back of Z-order on idle
-    "move_to_back_timeout_s":        300,
-    "fade_to_transparent_enable":    False,   # reduce window alpha on idle
-    "fade_to_transparent_timeout_s": 600,
-    "normal_alpha":                  ALPHA_OPAQUE,    # window opacity at rest
-    "faded_alpha":                   ALPHA_FADE_MIN,  # target opacity when fully faded
-    "window_x":                      None,    # last-known position; None = let WM place
-    "window_y":                      None,
+    "highlight_duration_s":     20.0,         # row-flash fade duration
+    "show_removed_s":           60,           # 0 = don't show removed ports
+    "always_on_top":            True,         # pin the window above all others
+    "always_on_top_timeout_s":  0,            # 0 = never drop; else drop after idle
+    "interaction_timeout_s":    2,            # seconds with no mouse/focus before fading
+    "move_to_back_enable":      False,        # push window to back of Z-order on idle
+    "move_to_back_timeout_s":   300,
+    "normal_alpha":             ALPHA_OPAQUE, # window opacity while interactive
+    "row_alpha":                0.85,         # opacity for rows once chrome is hidden
+    "window_x":                 None,         # last-known position
+    "window_y":                 None,
 }
 
 
@@ -185,13 +183,15 @@ class ComMonitor(tk.Tk):
         self._initialized  = False                    # skip flash for ports present at startup
         self._row_widgets: list[list[tk.Widget]] = []
         self._drag_ox = self._drag_oy = 0
-        self._dimmed  = False
 
-        # AOT / push-to-back state
+        # interaction-driven fade + on-change top-most state
         self._known_ports: set[str] = set()
-        self._last_change = time.time()
-        self._topmost_active = self.settings["always_on_top"]
-        self._bg_active      = False
+        self._last_interaction = time.time()
+        self._top_until        = 0.0          # window stays topmost while now < this
+        self._top_active       = self.settings["always_on_top"]
+        self._bg_active        = False
+        self._colorkey_active  = False
+        self._chrome_saved_text: dict = {}
         self._flash_decay_k = self._compute_flash_decay_k()
 
         self._build_ui()
@@ -200,43 +200,51 @@ class ComMonitor(tk.Tk):
 
     # ── layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
+        # widgets whose bg should drop out together with the window bg
+        # while the float-rows colorkey is active
+        self._chrome_widgets: list[tuple[tk.Widget, str]] = []
+
         bar = tk.Frame(self, bg=C_HDR, cursor="fleur")
         bar.pack(fill=tk.X)
         bar.bind("<ButtonPress-1>", self._drag_start)
         bar.bind("<B1-Motion>",     self._drag_move)
+        self._chrome_widgets.append((bar, C_HDR))
 
-        tk.Label(bar, text="  USB COM Monitor",
-                 bg=C_HDR, fg="#666666", font=("Segoe UI", 8),
-                 pady=4).pack(side=tk.LEFT)
-        tk.Button(bar, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0, relief="flat",
-                  font=("Segoe UI", 8),
-                  activebackground="#c0392b", activeforeground="white",
-                  command=self.destroy).pack(side=tk.RIGHT)
+        title_lbl = tk.Label(bar, text="  USB COM Monitor",
+                             bg=C_HDR, fg="#666666", font=("Segoe UI", 8),
+                             pady=4)
+        title_lbl.pack(side=tk.LEFT)
+        self._chrome_widgets.append((title_lbl, C_HDR))
 
-        self._dim_btn = tk.Button(
-            bar, text=" ◑ ", bg=C_HDR, fg="#666666", bd=0, relief="flat",
-            font=("Segoe UI", 8),
-            activebackground=C_HDR, activeforeground="#aaaaaa",
-            command=self._toggle_dim)
-        self._dim_btn.pack(side=tk.RIGHT)
+        close_btn = tk.Button(bar, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
+                              relief="flat", font=("Segoe UI", 8),
+                              activebackground="#c0392b", activeforeground="white",
+                              command=self.destroy)
+        close_btn.pack(side=tk.RIGHT)
+        self._chrome_widgets.append((close_btn, C_HDR))
 
-        tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0, relief="flat",
-                  font=("Segoe UI", 8),
-                  activebackground=C_HDR, activeforeground="#aaaaaa",
-                  command=self._open_settings).pack(side=tk.RIGHT)
+        gear_btn = tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
+                             relief="flat", font=("Segoe UI", 8),
+                             activebackground=C_HDR, activeforeground="#aaaaaa",
+                             command=self._open_settings)
+        gear_btn.pack(side=tk.RIGHT)
+        self._chrome_widgets.append((gear_btn, C_HDR))
 
         self._grid = tk.Frame(self, bg=C_BG)
         self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
 
         for c, (name, anchor, stretch) in enumerate(COLS):
-            tk.Label(self._grid, text=name, bg=C_BG, fg=C_HEAD,
-                     font=FONT_HDR, anchor=anchor, padx=3
-                     ).grid(row=0, column=c, sticky="ew")
+            col_hdr = tk.Label(self._grid, text=name, bg=C_BG, fg=C_HEAD,
+                               font=FONT_HDR, anchor=anchor, padx=3)
+            col_hdr.grid(row=0, column=c, sticky="ew")
+            self._chrome_widgets.append((col_hdr, C_BG))
             if stretch:
                 self._grid.columnconfigure(c, weight=1)
 
-        tk.Frame(self._grid, bg="#333333", height=1).grid(
-            row=1, column=0, columnspan=len(COLS), sticky="ew", pady=(1, 3))
+        divider = tk.Frame(self._grid, bg="#333333", height=1)
+        divider.grid(row=1, column=0, columnspan=len(COLS),
+                     sticky="ew", pady=(1, 3))
+        self._chrome_widgets.append((divider, "#333333"))
 
         self._empty_lbl = tk.Label(
             self._grid, text="(no COM ports detected)",
@@ -245,36 +253,57 @@ class ComMonitor(tk.Tk):
         self.bind("<Escape>",    lambda _: self.destroy())
         self.bind("<Control-q>", lambda _: self.destroy())
 
-        # interaction wakes the window from any idle fade / push-to-back
-        self.bind("<Button>",  self._wake)
-        self.bind("<Enter>",   self._wake)
-        self.bind("<FocusIn>", self._wake)
+        # immediate wake on click / mouse-cross / focus; idle is otherwise
+        # determined by the _refresh poll of pointer position and focus state.
+        self.bind("<Button>",  self._on_interact)
+        self.bind("<Enter>",   self._on_interact)
+        self.bind("<FocusIn>", self._on_interact)
+        self.bind("<Motion>",  self._on_interact)
 
-    # ── transparency toggle ───────────────────────────────────────────────────
-    def _toggle_dim(self):
-        self._dimmed = not self._dimmed
-        self._dim_btn.config(fg="#aaaaaa" if self._dimmed else "#666666")
-        self._update_alpha()
-
+    # ── transparency ──────────────────────────────────────────────────────────
     def _update_alpha(self):
         normal = self.settings.get("normal_alpha", ALPHA_OPAQUE)
-        faded  = self.settings.get("faded_alpha",  ALPHA_FADE_MIN)
-        base = ALPHA_DIM if self._dimmed else normal
-        f = 0.0
-        if self.settings.get("fade_to_transparent_enable"):
-            threshold = self.settings["fade_to_transparent_timeout_s"]
-            idle = time.time() - self._last_change
-            if idle > threshold:
-                f = min(1.0, (idle - threshold) / FADE_RAMP_S)
-        target = base - (base - faded) * f
+        row    = self.settings.get("row_alpha",    ALPHA_OPAQUE)
+        threshold = self.settings["interaction_timeout_s"]
+        idle = time.time() - self._last_interaction
+        if idle > threshold:
+            f = min(1.0, (idle - threshold) / FADE_RAMP_S)
+        else:
+            f = 0.0
+        # Smoothly fade the whole window from `normal` toward `row` over the
+        # ramp. At full fade snap the colorkey on so window chrome drops out
+        # and only the rows remain at their `row` alpha.
+        target = normal - (normal - row) * f
         self.attributes("-alpha", target)
+        self._set_colorkey(f >= 1.0)
 
-    def _wake(self, _event=None):
-        """Restart the idle timeout — pull the window out of any fade or push-to-back."""
-        self._last_change = time.time()
-        if self.settings["always_on_top"] and not self._topmost_active:
-            self.attributes("-topmost", True)
-            self._topmost_active = True
+    def _set_colorkey(self, on: bool):
+        if on == self._colorkey_active:
+            return
+        try:
+            self.attributes("-transparentcolor", C_TRANS_KEY if on else "")
+        except tk.TclError:
+            return                          # not supported on this platform
+        root_bg = C_TRANS_KEY if on else C_BG
+        self.configure(bg=root_bg)
+        self._grid.configure(bg=root_bg)
+        for w, normal_bg in self._chrome_widgets:
+            w.configure(bg=C_TRANS_KEY if on else normal_bg)
+            # also blank out text/icons — setting fg to the key still leaves
+            # ClearType-rendered glyph pixels visible on Windows.
+            try:
+                if on:
+                    self._chrome_saved_text[w] = w.cget("text")
+                    w.configure(text="")
+                elif w in self._chrome_saved_text:
+                    w.configure(text=self._chrome_saved_text.pop(w))
+            except tk.TclError:
+                pass
+        self._colorkey_active = on
+
+    def _on_interact(self, _event=None):
+        """Immediate wake — restart the interaction timer and restore visibility."""
+        self._last_interaction = time.time()
         if self._bg_active:
             self.lift()
             self._bg_active = False
@@ -331,10 +360,10 @@ class ComMonitor(tk.Tk):
 
     def _apply_settings(self):
         """Re-apply settings to derived state after they've been edited."""
-        self._flash_decay_k  = self._compute_flash_decay_k()
+        self._flash_decay_k    = self._compute_flash_decay_k()
+        self._last_interaction = time.time()
         self.attributes("-topmost", self.settings["always_on_top"])
-        self._topmost_active = self.settings["always_on_top"]
-        self._last_change    = time.time()
+        self._top_active = self.settings["always_on_top"]
         self._update_alpha()
 
     def _open_settings(self):
@@ -384,38 +413,57 @@ class ComMonitor(tk.Tk):
                 self._flash_start.pop(dev, None)
                 self._port_info.pop(dev, None)
 
-        # AOT timeout: re-enable on port change, drop after idle period
-        if self._initialized and current != self._known_ports:
-            self._last_change = now
-            if self.settings["always_on_top"] and not self._topmost_active:
-                self.attributes("-topmost", True)
-                self._topmost_active = True
+        # port changes lift the window and pin it on top for one interaction
+        # timeout so the user actually notices the connect / disconnect.
+        port_changed = self._initialized and current != self._known_ports
+        if port_changed:
+            self._top_until = now + self.settings["interaction_timeout_s"]
+            self.lift()
         self._known_ports = current
 
-        if self.settings["always_on_top"] and self._topmost_active:
-            timeout = self.settings["always_on_top_timeout_s"]
-            if timeout > 0 and (now - self._last_change) > timeout:
-                self.attributes("-topmost", False)
-                self._topmost_active = False
+        # interaction poll: while the pointer is over the window OR the window
+        # holds keyboard focus, the timer is held at zero. Once the cursor
+        # leaves AND focus is gone, the timer starts counting.
+        try:
+            px, py = self.winfo_pointerxy()
+            wx, wy = self.winfo_rootx(), self.winfo_rooty()
+            ww, wh = self.winfo_width(), self.winfo_height()
+            mouse_in = wx <= px < wx + ww and wy <= py < wy + wh
+            focused  = self.focus_displayof() is not None
+            if mouse_in or focused:
+                self._last_interaction = now
+        except tk.TclError:
+            pass
 
-        # idle fades: window alpha
-        self._update_alpha()
+        idle = now - self._last_interaction
 
-        # push-to-back on idle (opposite of always-on-top)
-        desired_back = False
-        if self.settings.get("move_to_back_enable"):
-            threshold = self.settings["move_to_back_timeout_s"]
-            if threshold > 0 and (now - self._last_change) > threshold:
-                desired_back = True
-        if desired_back:
-            if self._topmost_active:
-                self.attributes("-topmost", False)
-                self._topmost_active = False
-            self.lower()                   # keep re-lowering so newly opened windows pass us
+        # always-on-top with optional drop-after-idle timeout
+        aot_on  = self.settings["always_on_top"]
+        aot_to  = self.settings["always_on_top_timeout_s"]
+        aot_live = aot_on and (aot_to == 0 or idle < aot_to)
+        want_top = aot_live or now < self._top_until
+
+        # push-to-back on idle (overridden by the port-change pin)
+        mtb_on  = self.settings.get("move_to_back_enable", False)
+        mtb_to  = self.settings.get("move_to_back_timeout_s", 0)
+        want_back = (mtb_on and mtb_to > 0 and idle > mtb_to
+                     and now >= self._top_until)
+
+        if want_top and not self._top_active:
+            self.attributes("-topmost", True)
+            self._top_active = True
+        elif not want_top and self._top_active:
+            self.attributes("-topmost", False)
+            self._top_active = False
+
+        if want_back and not self._bg_active:
+            self.lower()
             self._bg_active = True
-        elif self._bg_active:
+        elif not want_back and self._bg_active:
             self.lift()
             self._bg_active = False
+
+        self._update_alpha()
 
         self._initialized = True
 
@@ -571,19 +619,17 @@ class SettingsDialog(tk.Toplevel):
                        activebackground=C_BG, activeforeground=C_DESC,
                        font=FONT, anchor="w"
                        ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
-
-        # AOT idle timeout
         tk.Label(frm, text="     ↳ drop after idle (s, 0 = never):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
                  ).grid(row=3, column=0, sticky="w", **pad)
-        self.var_to = tk.IntVar(value=s["always_on_top_timeout_s"])
-        tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_to,
+        self.var_aot_to = tk.IntVar(value=s["always_on_top_timeout_s"])
+        tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_aot_to,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
                    ).grid(row=3, column=1, sticky="w", **pad)
 
-        # Move window to back on idle
+        # Move to background on idle
         self.var_mtb = tk.BooleanVar(value=s["move_to_back_enable"])
         tk.Checkbutton(frm, text="Move to background on idle",
                        variable=self.var_mtb,
@@ -601,48 +647,41 @@ class SettingsDialog(tk.Toplevel):
                    insertbackground=C_PORT
                    ).grid(row=5, column=1, sticky="w", **pad)
 
-        # Fade to transparent on idle
-        self.var_ftr = tk.BooleanVar(value=s["fade_to_transparent_enable"])
-        tk.Checkbutton(frm, text="Fade window to transparent on idle",
-                       variable=self.var_ftr,
-                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
-                       activebackground=C_BG, activeforeground=C_DESC,
-                       font=FONT, anchor="w"
-                       ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
-        tk.Label(frm, text="     ↳ after (s):",
+        # Interaction timeout (seconds before fade begins)
+        tk.Label(frm, text="Fade after no interaction (s):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=7, column=0, sticky="w", **pad)
-        self.var_ftr_to = tk.IntVar(value=s["fade_to_transparent_timeout_s"])
-        tk.Spinbox(frm, from_=1, to=86400, increment=10, textvariable=self.var_ftr_to,
+                 ).grid(row=6, column=0, sticky="w", **pad)
+        self.var_it = tk.IntVar(value=s["interaction_timeout_s"])
+        tk.Spinbox(frm, from_=1, to=3600, increment=1, textvariable=self.var_it,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=7, column=1, sticky="w", **pad)
+                   ).grid(row=6, column=1, sticky="w", **pad)
 
-        # Normal / faded transparency sliders (live preview via _preview_alpha)
+        # Normal / row transparency sliders (live preview)
         tk.Label(frm, text="Normal transparency:",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=8, column=0, sticky="w", **pad)
+                 ).grid(row=7, column=0, sticky="w", **pad)
         self.var_an = tk.DoubleVar(value=s["normal_alpha"])
-        tk.Scale(frm, from_=0.10, to=1.0, resolution=0.01,
+        tk.Scale(frm, from_=0.4, to=1.0, resolution=0.01,
                  orient=tk.HORIZONTAL, variable=self.var_an,
                  command=lambda v: self._preview_alpha("normal_alpha", v),
                  bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
                  highlightthickness=0, bd=0, length=160,
                  font=FONT, activebackground=C_PORT,
-                 ).grid(row=8, column=1, sticky="w", **pad)
+                 ).grid(row=7, column=1, sticky="w", **pad)
 
-        tk.Label(frm, text="Faded transparency:",
+        tk.Label(frm, text="Row transparency when faded:",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=9, column=0, sticky="w", **pad)
-        self.var_af = tk.DoubleVar(value=s["faded_alpha"])
-        tk.Scale(frm, from_=0.0, to=1.0, resolution=0.01,
-                 orient=tk.HORIZONTAL, variable=self.var_af,
-                 command=lambda v: self._preview_alpha("faded_alpha", v),
+                 ).grid(row=8, column=0, sticky="w", **pad)
+        self.var_ar = tk.DoubleVar(value=s["row_alpha"])
+        tk.Scale(frm, from_=0.1, to=1.0, resolution=0.01,
+                 orient=tk.HORIZONTAL, variable=self.var_ar,
+                 command=lambda v: self._preview_alpha("row_alpha", v),
                  bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
                  highlightthickness=0, bd=0, length=160,
                  font=FONT, activebackground=C_PORT,
-                 ).grid(row=9, column=1, sticky="w", **pad)
+                 ).grid(row=8, column=1, sticky="w", **pad)
 
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
@@ -678,17 +717,17 @@ class SettingsDialog(tk.Toplevel):
                 s["highlight_duration_s"] = v
         except (tk.TclError, ValueError):
             pass
-        s["always_on_top"] = bool(self.var_aot.get())
-        try:
-            v = int(self.var_to.get())
-            if v >= 0:
-                s["always_on_top_timeout_s"] = v
-        except (tk.TclError, ValueError):
-            pass
         try:
             v = int(self.var_sr.get())
             if v >= 0:
                 s["show_removed_s"] = v
+        except (tk.TclError, ValueError):
+            pass
+        s["always_on_top"] = bool(self.var_aot.get())
+        try:
+            v = int(self.var_aot_to.get())
+            if v >= 0:
+                s["always_on_top_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
         s["move_to_back_enable"] = bool(self.var_mtb.get())
@@ -698,11 +737,10 @@ class SettingsDialog(tk.Toplevel):
                 s["move_to_back_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
-        s["fade_to_transparent_enable"] = bool(self.var_ftr.get())
         try:
-            v = int(self.var_ftr_to.get())
+            v = int(self.var_it.get())
             if v > 0:
-                s["fade_to_transparent_timeout_s"] = v
+                s["interaction_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
         try:
@@ -710,7 +748,7 @@ class SettingsDialog(tk.Toplevel):
         except (tk.TclError, ValueError):
             pass
         try:
-            s["faded_alpha"] = float(self.var_af.get())
+            s["row_alpha"] = float(self.var_ar.get())
         except (tk.TclError, ValueError):
             pass
         save_settings(s)
