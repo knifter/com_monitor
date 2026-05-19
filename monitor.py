@@ -51,6 +51,7 @@ C_SER    = "#b0a0d0"
 C_ROW_GONE = "#7a1a1a"   # red peak for vanished-port row flash
 C_GONE     = "#a04848"   # foreground for "gone" status
 C_DIM      = "#555555"   # darkened text for vanished ports
+C_WAIT     = "#e6a500"   # amber 'waiting' status (we want to open, port is locked)
 
 FONT         = ("Consolas", 10)
 FONT_BOLD    = ("Consolas", 10, "bold")
@@ -88,7 +89,19 @@ DEFAULT_SETTINGS = {
     "window_x":                 None,         # last-known position
     "window_y":                 None,
     "custom_names":             {},           # {"VID:PID:SERIAL": user-given name}
+    "terminal_size":            "640x400",    # remembered terminal WxH
+    "port_settings":            {},           # {"VID:PID:SERIAL": port-specific serial config}
 }
+
+DEFAULT_PORT_SETTINGS = {
+    "baud":        115200,
+    "data_bits":   8,
+    "parity":      "N",                       # N/E/O/M/S
+    "stop_bits":   1,                         # 1, 1.5, 2
+    "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
+}
+
+TERM_POLL_MS = 50                             # serial-read poll cadence
 
 
 def load_settings() -> dict:
@@ -210,6 +223,8 @@ class ComMonitor(tk.Tk):
         self._edit_entry       = None        # tk.Entry overlaying a serial cell
         self._edit_lbl         = None        # serial Label hidden during edit
         self._edit_desc_lbl    = None        # description Label hidden during edit
+        self._terminal         = None        # only one Terminal open at a time
+        self._wanted_dev       = None        # device we want to open when it frees up
         self._flash_decay_k = self._compute_flash_decay_k()
 
         # font handles used to pre-compute matching column widths in both grids
@@ -414,6 +429,46 @@ class ComMonitor(tk.Tk):
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
 
+    # ── terminal open / wait ──────────────────────────────────────────────────
+    def _port_settings_for(self, key) -> dict:
+        """Merge DEFAULT_PORT_SETTINGS with the per-port overrides (if any)."""
+        s = dict(DEFAULT_PORT_SETTINGS)
+        if key is not None:
+            s.update(self.settings.get("port_settings", {}).get(key, {}))
+        return s
+
+    def _on_status_click(self, dev, key):
+        """Click on a row's status cell. Single-terminal policy: any open
+        terminal is closed before opening a different port."""
+        if self._terminal is not None and self._terminal.device == dev:
+            self._terminal.lift()
+            self._terminal.focus_set()
+            return
+        if self._wanted_dev == dev:
+            self._wanted_dev = None                     # cancel wait
+            return
+        if is_open(dev):
+            # someone else has it — line up to grab it as soon as it frees
+            self._wanted_dev = dev
+            return
+        self._open_terminal(dev, key)
+
+    def _open_terminal(self, dev, key):
+        if self._terminal is not None:
+            self._terminal._close_quiet()               # swap: close current first
+            self._terminal = None
+        self._wanted_dev = None
+        try:
+            self._terminal = Terminal(self, dev, key)
+        except Exception as e:                          # noqa: BLE001
+            print(f"Failed to open terminal for {dev}: {e}")
+            self._terminal = None
+
+    def _terminal_closed(self, term):
+        """Called by Terminal._on_close after it cleans up."""
+        if self._terminal is term:
+            self._terminal = None
+
     # ── inline edit of custom serial name ─────────────────────────────────────
     def _begin_serial_edit(self, lbl, key, desc_lbl=None):
         """Overlay an Entry on the serial cell so the user can type a custom
@@ -517,6 +572,9 @@ class ComMonitor(tk.Tk):
 
     def destroy(self):
         self._save_window_position()
+        if self._terminal is not None:
+            self._terminal._close_quiet()
+            self._terminal = None
         super().destroy()
 
     def _apply_settings(self):
@@ -573,6 +631,17 @@ class ComMonitor(tk.Tk):
                 self._first_seen.pop(dev, None)
                 self._flash_start.pop(dev, None)
                 self._port_info.pop(dev, None)
+
+        # if a port we're waiting for has freed up, grab it now
+        if self._wanted_dev is not None:
+            if self._wanted_dev not in current:
+                self._wanted_dev = None                 # device gone, drop wait
+            elif not is_open(self._wanted_dev):
+                dev_w = self._wanted_dev
+                info  = self._port_info.get(dev_w, {})
+                key   = _custom_key(info.get("vid"), info.get("pid"),
+                                    info.get("serial_number"))
+                self._open_terminal(dev_w, key)
 
         # port changes lift the window pair and pin them on top for one
         # interaction timeout so the user actually notices the connect/disconnect.
@@ -679,7 +748,11 @@ class ComMonitor(tk.Tk):
                     desc_c     = C_DIM
                 else:
                     age_s    = now - self._first_seen[dev]
-                    occupied = is_open(dev)
+                    ours     = (self._terminal is not None
+                                and self._terminal.device == dev)
+                    occupied = ours or is_open(dev)
+                    waiting  = (not ours and not is_open(dev)
+                                and self._wanted_dev == dev)
 
                     flash_t = now - self._flash_start[dev] if dev in self._flash_start else None
                     if flash_t is not None:
@@ -693,8 +766,12 @@ class ComMonitor(tk.Tk):
                     fresh  = age_s < NEW_DOT_S
                     dot_c  = C_NEW if fresh else (C_OPEN if occupied else C_FREE)
                     age_c  = C_NEW if fresh else C_AGE
-                    stat_t = "OPEN" if occupied else "free"
-                    stat_c = C_OPEN if occupied else C_FREE
+                    if waiting:
+                        stat_t, stat_c = "waiting", C_WAIT
+                    elif occupied:
+                        stat_t, stat_c = "OPEN", C_OPEN
+                    else:
+                        stat_t, stat_c = "free", C_FREE
                     port_c = C_PORT
                     vid_c  = C_VIDPID
                     ser_c  = C_SER
@@ -724,12 +801,15 @@ class ComMonitor(tk.Tk):
                 row_w = []
                 serial_lbl = None
                 desc_lbl   = None
+                status_lbl = None
                 for col, span, kw in cells:
                     kw.setdefault("font", row_font)
                     lbl = tk.Label(self._grid, bg=row_bg, padx=3, pady=1, **kw)
                     lbl.grid(row=i, column=col, columnspan=span, sticky="ew")
                     row_w.append(lbl)
-                    if col == 5:
+                    if col == 4:
+                        status_lbl = lbl
+                    elif col == 5:
                         serial_lbl = lbl
                     elif col == 6:
                         desc_lbl = lbl
@@ -738,6 +818,13 @@ class ComMonitor(tk.Tk):
                     serial_lbl.bind("<Double-Button-1>",
                         lambda _e, k=custom_key, sw=serial_lbl, dw=desc_lbl:
                             self._begin_serial_edit(sw, k, dw))
+
+                # status cell drives terminal open / wait / cancel
+                if status_lbl is not None and not gone:
+                    status_lbl.configure(cursor="hand2")
+                    status_lbl.bind("<Button-1>",
+                        lambda _e, d=dev, k=custom_key:
+                            self._on_status_click(d, k))
 
                 self._row_widgets.append(row_w)
 
@@ -935,6 +1022,293 @@ class SettingsDialog(tk.Toplevel):
         save_settings(s)
         self.parent._apply_settings()
         self._saved = True
+        self.destroy()
+
+
+# ── terminal ──────────────────────────────────────────────────────────────────
+class Terminal(tk.Toplevel):
+    def __init__(self, parent: ComMonitor, device: str, key):
+        super().__init__(parent)
+        self.parent   = parent
+        self.device   = device
+        self.key      = key
+        self.serial: "serial.Serial | None" = None
+        self._poll_id = None
+        self._closing = False
+
+        self.title(f"Terminal — {device}")
+        self.configure(bg=C_BG)
+        self.geometry(parent.settings.get("terminal_size", "640x400"))
+
+        self._build_ui()
+        self.update_idletasks()
+        self._position_above_main()
+        self._open_serial()
+        self._schedule_poll()
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.bind("<Configure>", self._on_configure)
+        self.inp.focus_set()
+
+    def _build_ui(self):
+        top = tk.Frame(self, bg=C_HDR)
+        top.pack(fill=tk.X)
+        tk.Label(top, text=self.device, bg=C_HDR, fg=C_PORT,
+                 font=FONT_BOLD, padx=8, pady=4).pack(side=tk.LEFT)
+        tk.Button(top, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground="#c0392b", activeforeground="white",
+                  command=self._on_close).pack(side=tk.RIGHT)
+        tk.Button(top, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="#aaaaaa",
+                  command=self._open_port_settings).pack(side=tk.RIGHT)
+        tk.Button(top, text=" Clear ", bg=C_HDR, fg="#666666", bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="#aaaaaa",
+                  command=self._clear).pack(side=tk.RIGHT)
+
+        out_frm = tk.Frame(self, bg=C_BG)
+        out_frm.pack(fill=tk.BOTH, expand=True)
+        self.out = tk.Text(out_frm, bg=C_BG, fg=C_DESC, font=FONT,
+                           bd=0, wrap=tk.NONE, padx=6, pady=4,
+                           insertbackground=C_PORT)
+        scr = tk.Scrollbar(out_frm, command=self.out.yview,
+                           bg=C_HDR, troughcolor=C_BG, bd=0)
+        self.out.configure(yscrollcommand=scr.set, state="disabled")
+        scr.pack(side=tk.RIGHT, fill=tk.Y)
+        self.out.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.out.tag_configure("tx",   foreground=C_DIM)
+        self.out.tag_configure("rx",   foreground=C_DESC)
+        self.out.tag_configure("info", foreground=C_NEW)
+
+        self.inp = tk.Entry(self, bg=C_HDR, fg=C_PORT, font=FONT, bd=0,
+                            relief="flat", insertbackground=C_PORT)
+        self.inp.pack(fill=tk.X, padx=6, pady=(0, 6))
+        self.inp.bind("<Return>", self._on_send)
+
+    def _open_serial(self):
+        s = self.parent._port_settings_for(self.key)
+        try:
+            self.serial = serial.Serial(
+                self.device,
+                baudrate=s["baud"],
+                bytesize=s["data_bits"],
+                parity=s["parity"],
+                stopbits=s["stop_bits"],
+                timeout=0)
+            self._info(f"[connected @ {s['baud']} "
+                       f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
+        except (serial.SerialException, OSError, ValueError) as e:
+            self.serial = None
+            self._info(f"[open failed: {e}]")
+
+    def _close_serial(self):
+        if self.serial is not None:
+            try:
+                self.serial.close()
+            except Exception:                           # noqa: BLE001
+                pass
+            self.serial = None
+
+    def _schedule_poll(self):
+        self._poll_id = self.after(TERM_POLL_MS, self._poll)
+
+    def _poll(self):
+        self._poll_id = None
+        if self._closing:
+            return
+        if self.serial is not None:
+            try:
+                n = self.serial.in_waiting
+                if n:
+                    data = self.serial.read(n)
+                    self._append(data.decode("utf-8", errors="replace"), "rx")
+            except (serial.SerialException, OSError) as e:
+                self._info(f"[read error: {e}]")
+                self._close_serial()
+        self._schedule_poll()
+
+    def _on_send(self, _e=None):
+        line = self.inp.get()
+        self.inp.delete(0, tk.END)
+        if self.serial is None:
+            self._info("[not connected]")
+            return "break"
+        s = self.parent._port_settings_for(self.key)
+        try:
+            self.serial.write((line + s["line_ending"])
+                              .encode("utf-8", errors="replace"))
+            self._append(line + "\n", "tx")
+        except (serial.SerialException, OSError) as e:
+            self._info(f"[write error: {e}]")
+            self._close_serial()
+        return "break"
+
+    def _append(self, text, tag):
+        self.out.configure(state="normal")
+        self.out.insert(tk.END, text, tag)
+        self.out.see(tk.END)
+        self.out.configure(state="disabled")
+
+    def _info(self, text):
+        self._append(text + "\n", "info")
+
+    def _clear(self):
+        self.out.configure(state="normal")
+        self.out.delete("1.0", tk.END)
+        self.out.configure(state="disabled")
+
+    def _open_port_settings(self):
+        PortSettingsDialog(self)
+
+    def reconnect(self):
+        """Reopen the serial port with whatever port_settings are now in effect."""
+        self._close_serial()
+        self._open_serial()
+
+    def _position_above_main(self):
+        try:
+            x = self.parent.winfo_rootx()
+            y = self.parent.winfo_rooty() - self.winfo_height() - 5
+            self.geometry(f"+{x}+{max(0, y)}")
+        except tk.TclError:
+            pass
+
+    def _on_configure(self, _e=None):
+        if self._closing:
+            return
+        try:
+            w, h = self.winfo_width(), self.winfo_height()
+        except tk.TclError:
+            return
+        if w > 1 and h > 1:
+            self.parent.settings["terminal_size"] = f"{w}x{h}"
+
+    def _close_quiet(self):
+        """Tear down without notifying parent — used by swap / shutdown paths."""
+        if self._closing:
+            return
+        self._closing = True
+        save_settings(self.parent.settings)             # persist size
+        if self._poll_id is not None:
+            try:
+                self.after_cancel(self._poll_id)
+            except tk.TclError:
+                pass
+            self._poll_id = None
+        self._close_serial()
+        try:
+            self.destroy()
+        except tk.TclError:
+            pass
+
+    def _on_close(self):
+        """User clicked the X — clean up and tell the parent we're gone."""
+        parent = self.parent
+        self._close_quiet()
+        parent._terminal_closed(self)
+
+
+# ── port settings dialog (per VID:PID:Serial) ─────────────────────────────────
+class PortSettingsDialog(tk.Toplevel):
+    BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
+    LE_TO_LABEL = {"\r\n": "CRLF", "\n": "LF", "\r": "CR", "": "none"}
+    LABEL_TO_LE = {v: k for k, v in LE_TO_LABEL.items()}
+
+    def __init__(self, terminal: "Terminal"):
+        super().__init__(terminal)
+        self.terminal = terminal
+        self.title("Port settings")
+        self.configure(bg=C_BG)
+        self.transient(terminal)
+        self.resizable(False, False)
+        self.attributes("-topmost", True)
+        self._build()
+        self.update_idletasks()
+        px = terminal.winfo_rootx() + (terminal.winfo_width()
+                                        - self.winfo_width()) // 2
+        py = terminal.winfo_rooty() + 80
+        self.geometry(f"+{max(px, 0)}+{max(py, 0)}")
+        self.grab_set()
+        self.bind("<Escape>", lambda _: self.destroy())
+
+    def _build(self):
+        s   = self.terminal.parent._port_settings_for(self.terminal.key)
+        pad = dict(padx=8, pady=4)
+
+        frm = tk.Frame(self, bg=C_BG)
+        frm.pack(padx=12, pady=(12, 6))
+
+        def label(r, text):
+            tk.Label(frm, text=text, bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                     ).grid(row=r, column=0, sticky="w", **pad)
+
+        def spin(r, var, values):
+            tk.Spinbox(frm, values=values, textvariable=var, width=10,
+                       bg=C_HDR, fg=C_PORT, font=FONT,
+                       buttonbackground=C_HDR, relief="flat",
+                       insertbackground=C_PORT
+                       ).grid(row=r, column=1, sticky="w", **pad)
+
+        label(0, "Baud:")
+        self.var_baud = tk.IntVar(value=s["baud"])
+        spin(0, self.var_baud, self.BAUDS)
+
+        label(1, "Data bits:")
+        self.var_data = tk.IntVar(value=s["data_bits"])
+        spin(1, self.var_data, (5, 6, 7, 8))
+
+        label(2, "Parity:")
+        self.var_par = tk.StringVar(value=s["parity"])
+        spin(2, self.var_par, ("N", "E", "O", "M", "S"))
+
+        label(3, "Stop bits:")
+        self.var_stop = tk.DoubleVar(value=s["stop_bits"])
+        spin(3, self.var_stop, (1, 1.5, 2))
+
+        label(4, "Line ending:")
+        self.var_le = tk.StringVar(
+            value=self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
+        spin(4, self.var_le, tuple(self.LE_TO_LABEL.values()))
+
+        btns = tk.Frame(self, bg=C_BG)
+        btns.pack(fill=tk.X, padx=12, pady=(0, 12))
+        tk.Button(btns, text="Cancel", command=self.destroy,
+                  bg=C_HDR, fg=C_DESC, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white",
+                  padx=14, pady=3).pack(side=tk.RIGHT, padx=(6, 0))
+        tk.Button(btns, text="Save", command=self._save,
+                  bg=C_HDR, fg=C_PORT, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white",
+                  padx=14, pady=3).pack(side=tk.RIGHT)
+
+    def _save(self):
+        if self.terminal.key is None:
+            self.destroy()
+            return
+        new = dict(DEFAULT_PORT_SETTINGS)
+        try: new["baud"]      = int(self.var_baud.get())
+        except (tk.TclError, ValueError): pass
+        try: new["data_bits"] = int(self.var_data.get())
+        except (tk.TclError, ValueError): pass
+        try:
+            p = str(self.var_par.get()).strip().upper()
+            if p and p[0] in "NEOMS":
+                new["parity"] = p[0]
+        except (tk.TclError, ValueError): pass
+        try:
+            sv = float(self.var_stop.get())
+            new["stop_bits"] = int(sv) if sv.is_integer() else sv
+        except (tk.TclError, ValueError): pass
+        try: new["line_ending"] = self.LABEL_TO_LE.get(
+                                    self.var_le.get(), "\r\n")
+        except (tk.TclError, ValueError): pass
+
+        settings = self.terminal.parent.settings
+        settings.setdefault("port_settings", {})[self.terminal.key] = new
+        save_settings(settings)
+        self.terminal.reconnect()
         self.destroy()
 
 
