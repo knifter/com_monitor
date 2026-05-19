@@ -8,6 +8,7 @@ Needs:  pip install pyserial pywin32
 """
 
 import tkinter as tk
+import tkinter.font as tkfont
 import math
 import time
 import json
@@ -50,14 +51,13 @@ C_SER    = "#b0a0d0"
 C_ROW_GONE = "#7a1a1a"   # red peak for vanished-port row flash
 C_GONE     = "#a04848"   # foreground for "gone" status
 C_DIM      = "#555555"   # darkened text for vanished ports
-C_TRANS_KEY = "#FF00FF"  # color used as Windows "transparentcolor" key — never drawn
 
 FONT      = ("Consolas", 10)
 FONT_BOLD = ("Consolas", 10, "bold")
 FONT_HDR  = ("Consolas", 9, "bold")
 
 ALPHA_OPAQUE = 0.96
-FADE_RAMP_S  = 2.5       # seconds for chrome text to fade into its background
+FADE_RAMP_S  = 2.5       # seconds for chrome to fade to fully transparent
 FADE_TICK_MS = 40        # animation tick while the fade ramp is running
 
 COLS = [
@@ -190,144 +190,188 @@ class ComMonitor(tk.Tk):
         self._top_until        = 0.0          # window stays topmost while now < this
         self._top_active       = self.settings["always_on_top"]
         self._bg_active        = False
-        self._colorkey_active  = False
-        self._chrome_saved_text: dict = {}
-        self._last_fade_f      = -1.0
+        self._last_chrome_alpha = -1.0
         self._flash_decay_k = self._compute_flash_decay_k()
 
+        # font handles used to pre-compute matching column widths in both grids
+        self._f_row = tkfont.Font(family="Consolas", size=10)
+        self._f_hdr = tkfont.Font(family="Consolas", size=9, weight="bold")
+
         self._build_ui()
+        self.bind("<Configure>", self._sync_rows_geometry)
         self._refresh()
         self._animate_fade()
         self._restore_window_position()
+        self._sync_rows_geometry()
+        self._rows_win.deiconify()                      # reveal once placed
 
     # ── layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
-        # (widget, normal_bg, normal_fg|None) — fg lerps toward bg during the
-        # ramp; bg snaps to the colorkey color at f=1.0
-        self._chrome_widgets: list[tuple[tk.Widget, str, str | None]] = []
-
+        # Chrome window (self) holds the title bar and the column-header strip.
+        # Its -alpha animates from normal → 0 over the fade ramp.
         bar = tk.Frame(self, bg=C_HDR, cursor="fleur")
         bar.pack(fill=tk.X)
         bar.bind("<ButtonPress-1>", self._drag_start)
         bar.bind("<B1-Motion>",     self._drag_move)
-        self._chrome_widgets.append((bar, C_HDR, None))
 
-        title_lbl = tk.Label(bar, text="  USB COM Monitor",
-                             bg=C_HDR, fg="#666666", font=("Segoe UI", 8),
-                             pady=4)
-        title_lbl.pack(side=tk.LEFT)
-        self._chrome_widgets.append((title_lbl, C_HDR, "#666666"))
+        tk.Label(bar, text="  USB COM Monitor",
+                 bg=C_HDR, fg="#666666", font=("Segoe UI", 8),
+                 pady=4).pack(side=tk.LEFT)
 
-        close_btn = tk.Button(bar, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
-                              relief="flat", font=("Segoe UI", 8),
-                              activebackground="#c0392b", activeforeground="white",
-                              command=self.destroy)
-        close_btn.pack(side=tk.RIGHT)
-        self._chrome_widgets.append((close_btn, C_HDR, "#666666"))
+        tk.Button(bar, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground="#c0392b", activeforeground="white",
+                  command=self.destroy).pack(side=tk.RIGHT)
 
-        gear_btn = tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
-                             relief="flat", font=("Segoe UI", 8),
-                             activebackground=C_HDR, activeforeground="#aaaaaa",
-                             command=self._open_settings)
-        gear_btn.pack(side=tk.RIGHT)
-        self._chrome_widgets.append((gear_btn, C_HDR, "#666666"))
+        tk.Button(bar, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="#aaaaaa",
+                  command=self._open_settings).pack(side=tk.RIGHT)
 
-        self._grid = tk.Frame(self, bg=C_BG)
-        self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(3, 6))
+        self._hdr_grid = tk.Frame(self, bg=C_BG)
+        self._hdr_grid.pack(fill=tk.X, padx=6, pady=(3, 0))
 
         for c, (name, anchor, stretch) in enumerate(COLS):
-            col_hdr = tk.Label(self._grid, text=name, bg=C_BG, fg=C_HEAD,
-                               font=FONT_HDR, anchor=anchor, padx=3)
-            col_hdr.grid(row=0, column=c, sticky="ew")
-            self._chrome_widgets.append((col_hdr, C_BG, C_HEAD))
+            tk.Label(self._hdr_grid, text=name, bg=C_BG, fg=C_HEAD,
+                     font=FONT_HDR, anchor=anchor, padx=3
+                     ).grid(row=0, column=c, sticky="ew")
+            if stretch:
+                self._hdr_grid.columnconfigure(c, weight=1)
+
+        tk.Frame(self._hdr_grid, bg="#333333", height=1).grid(
+            row=1, column=0, columnspan=len(COLS), sticky="ew", pady=(1, 0))
+
+        # Rows window — borderless Toplevel that always tracks the chrome
+        # window's position. Holds the data grid only; its -alpha stays at
+        # normal_alpha so rows never fade.
+        self._rows_win = tk.Toplevel(self, bg=C_BG)
+        self._rows_win.withdraw()                       # hidden until positioned
+        self._rows_win.overrideredirect(True)
+        self._rows_win.attributes("-topmost", self.settings["always_on_top"])
+        self._rows_win.attributes("-alpha",   self.settings["normal_alpha"])
+
+        self._grid = tk.Frame(self._rows_win, bg=C_BG)
+        self._grid.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+
+        for c, (_, _, stretch) in enumerate(COLS):
             if stretch:
                 self._grid.columnconfigure(c, weight=1)
-
-        divider = tk.Frame(self._grid, bg="#333333", height=1)
-        divider.grid(row=1, column=0, columnspan=len(COLS),
-                     sticky="ew", pady=(1, 3))
-        self._chrome_widgets.append((divider, "#333333", None))
 
         self._empty_lbl = tk.Label(
             self._grid, text="(no COM ports detected)",
             bg=C_BG, fg="#3a3a3a", font=FONT, anchor="w", padx=3)
 
-        self.bind("<Escape>",    lambda _: self.destroy())
-        self.bind("<Control-q>", lambda _: self.destroy())
+        # dragging anywhere in the rows area also moves the pair
+        self._grid.bind("<ButtonPress-1>", self._drag_start)
+        self._grid.bind("<B1-Motion>",     self._drag_move)
 
-        # immediate wake on click / mouse-cross / focus; idle is otherwise
-        # determined by the _refresh poll of pointer position and focus state.
-        self.bind("<Button>",  self._on_interact)
-        self.bind("<Enter>",   self._on_interact)
-        self.bind("<FocusIn>", self._on_interact)
-        self.bind("<Motion>",  self._on_interact)
+        for w in (self, self._rows_win):
+            w.bind("<Escape>",    lambda _: self.destroy())
+            w.bind("<Control-q>", lambda _: self.destroy())
+            w.bind("<Button>",    self._on_interact)
+            w.bind("<Enter>",     self._on_interact)
+            w.bind("<FocusIn>",   self._on_interact)
+            w.bind("<Motion>",    self._on_interact)
 
     # ── transparency ──────────────────────────────────────────────────────────
     def _update_alpha(self):
-        normal = self.settings.get("normal_alpha", ALPHA_OPAQUE)
-        self.attributes("-alpha", normal)
+        normal    = self.settings.get("normal_alpha", ALPHA_OPAQUE)
         threshold = self.settings["interaction_timeout_s"]
-        idle = time.time() - self._last_interaction
-        if idle > threshold:
-            f = min(1.0, (idle - threshold) / FADE_RAMP_S)
-        else:
-            f = 0.0
-        if f == self._last_fade_f:
-            return                           # nothing changed since last tick
-        self._last_fade_f = f
-        # Chrome text crossfades into its own background as f goes 0→1; at
-        # f=1.0 the colorkey snaps on and the (now empty-looking) chrome
-        # background becomes truly transparent.
-        if f < 1.0:
-            self._set_colorkey(False)
-            for w, normal_bg, normal_fg in self._chrome_widgets:
-                if normal_fg is None:
-                    continue
-                try:
-                    w.configure(fg=_blend(normal_fg, normal_bg, f))
-                except tk.TclError:
-                    pass
-        else:
-            self._set_colorkey(True)
-
-    def _set_colorkey(self, on: bool):
-        if on == self._colorkey_active:
-            return
+        idle      = time.time() - self._last_interaction
+        f = min(1.0, (idle - threshold) / FADE_RAMP_S) if idle > threshold else 0.0
+        # rows window holds its opacity; only the chrome window fades
         try:
-            self.attributes("-transparentcolor", C_TRANS_KEY if on else "")
+            self._rows_win.attributes("-alpha", normal)
         except tk.TclError:
-            return                          # not supported on this platform
-        root_bg = C_TRANS_KEY if on else C_BG
-        self.configure(bg=root_bg)
-        self._grid.configure(bg=root_bg)
-        for w, normal_bg, normal_fg in self._chrome_widgets:
-            w.configure(bg=C_TRANS_KEY if on else normal_bg)
-            # also blank out text/icons — setting fg to the key still leaves
-            # ClearType-rendered glyph pixels visible on Windows.
-            try:
-                if on:
-                    self._chrome_saved_text[w] = w.cget("text")
-                    w.configure(text="")
-                else:
-                    if w in self._chrome_saved_text:
-                        w.configure(text=self._chrome_saved_text.pop(w))
-                    if normal_fg is not None:
-                        w.configure(fg=normal_fg)
-            except tk.TclError:
-                pass
-        self._colorkey_active = on
+            pass
+        chrome_alpha = normal * (1.0 - f)
+        if chrome_alpha != self._last_chrome_alpha:
+            self.attributes("-alpha", chrome_alpha)
+            self._last_chrome_alpha = chrome_alpha
 
     def _animate_fade(self):
         self._update_alpha()
         self.after(FADE_TICK_MS, self._animate_fade)
 
+    # ── two-window sync ───────────────────────────────────────────────────────
+    def _sync_rows_geometry(self, _event=None):
+        """Keep the rows Toplevel glued directly under the chrome window."""
+        try:
+            self.update_idletasks()
+            x = self.winfo_rootx()
+            y = self.winfo_rooty() + self.winfo_height()
+            self._rows_win.geometry(f"+{x}+{y}")        # position only — width auto
+        except tk.TclError:
+            pass
+
+    def _sync_column_widths(self):
+        """Pre-compute the per-column pixel width needed for the widest text in
+        either grid (header text or any data cell) and apply it as `minsize` to
+        both grids. With both grids on the same minsize, columns line up and
+        both windows end up the same total width."""
+        cell_pad = 6                                   # padx=3 on each side
+        col_w = [0] * len(COLS)
+
+        for c, (name, _, _) in enumerate(COLS):
+            col_w[c] = self._f_hdr.measure(name) + cell_pad
+
+        for row in self._row_widgets:
+            for c, lbl in enumerate(row):
+                try:
+                    text = lbl.cget("text")
+                except tk.TclError:
+                    continue
+                w = self._f_row.measure(text) + cell_pad
+                if w > col_w[c]:
+                    col_w[c] = w
+
+        for c, w in enumerate(col_w):
+            self._hdr_grid.columnconfigure(c, minsize=w)
+            self._grid.columnconfigure(c, minsize=w)
+
+        # force both windows to the same overall width so they read as one
+        self.update_idletasks()
+        self._rows_win.update_idletasks()
+        target_w = max(self.winfo_reqwidth(), self._rows_win.winfo_reqwidth())
+        x = self.winfo_rootx()
+        y = self.winfo_rooty()
+        self.geometry(f"{target_w}x{self.winfo_reqheight()}+{x}+{y}")
+        self._sync_rows_geometry()
+        self._rows_win.geometry(
+            f"{target_w}x{self._rows_win.winfo_reqheight()}"
+            f"+{x}+{y + self.winfo_reqheight()}")
+
     def _on_interact(self, _event=None):
         """Immediate wake — restart the interaction timer and restore visibility."""
         self._last_interaction = time.time()
         if self._bg_active:
-            self.lift()
+            self._lift_pair()
             self._bg_active = False
         self._update_alpha()
+
+    # ── paired Z-order helpers ───────────────────────────────────────────────
+    def _lift_pair(self):
+        """Bring both windows to the top of the stack while preserving their
+        relative order (chrome below, rows on top)."""
+        try:
+            self.lift()
+            self._rows_win.lift()
+        except tk.TclError:
+            pass
+
+    def _lower_pair(self):
+        try:
+            self._rows_win.lower()
+            self.lower()
+        except tk.TclError:
+            pass
+
+    def _set_topmost_pair(self, on: bool):
+        try:
+            self.attributes("-topmost", on)
+            self._rows_win.attributes("-topmost", on)
+        except tk.TclError:
+            pass
 
     # ── drag ─────────────────────────────────────────────────────────────────
     def _drag_start(self, e):
@@ -382,7 +426,7 @@ class ComMonitor(tk.Tk):
         """Re-apply settings to derived state after they've been edited."""
         self._flash_decay_k    = self._compute_flash_decay_k()
         self._last_interaction = time.time()
-        self.attributes("-topmost", self.settings["always_on_top"])
+        self._set_topmost_pair(self.settings["always_on_top"])
         self._top_active = self.settings["always_on_top"]
         self._update_alpha()
 
@@ -433,24 +477,28 @@ class ComMonitor(tk.Tk):
                 self._flash_start.pop(dev, None)
                 self._port_info.pop(dev, None)
 
-        # port changes lift the window and pin it on top for one interaction
-        # timeout so the user actually notices the connect / disconnect.
+        # port changes lift the window pair and pin them on top for one
+        # interaction timeout so the user actually notices the connect/disconnect.
         port_changed = self._initialized and current != self._known_ports
         if port_changed:
             self._top_until = now + self.settings["interaction_timeout_s"]
-            self.lift()
+            self._lift_pair()
         self._known_ports = current
 
-        # interaction poll: while the pointer is over the window OR the window
-        # holds keyboard focus, the timer is held at zero. Once the cursor
-        # leaves AND focus is gone, the timer starts counting.
+        # interaction poll: pointer over EITHER window (or focus on either)
+        # holds the timer at zero. Once both are gone, the timer starts counting.
         try:
             px, py = self.winfo_pointerxy()
-            wx, wy = self.winfo_rootx(), self.winfo_rooty()
-            ww, wh = self.winfo_width(), self.winfo_height()
-            mouse_in = wx <= px < wx + ww and wy <= py < wy + wh
-            focused  = self.focus_displayof() is not None
-            if mouse_in or focused:
+            in_any = False
+            for w in (self, self._rows_win):
+                wx, wy = w.winfo_rootx(), w.winfo_rooty()
+                ww, wh = w.winfo_width(), w.winfo_height()
+                if wx <= px < wx + ww and wy <= py < wy + wh:
+                    in_any = True
+                    break
+            focused = (self.focus_displayof() is not None
+                       or self._rows_win.focus_displayof() is not None)
+            if in_any or focused:
                 self._last_interaction = now
         except tk.TclError:
             pass
@@ -470,17 +518,17 @@ class ComMonitor(tk.Tk):
                      and now >= self._top_until)
 
         if want_top and not self._top_active:
-            self.attributes("-topmost", True)
+            self._set_topmost_pair(True)
             self._top_active = True
         elif not want_top and self._top_active:
-            self.attributes("-topmost", False)
+            self._set_topmost_pair(False)
             self._top_active = False
 
         if want_back and not self._bg_active:
-            self.lower()
+            self._lower_pair()
             self._bg_active = True
         elif not want_back and self._bg_active:
-            self.lift()
+            self._lift_pair()
             self._bg_active = False
 
         self._update_alpha()
@@ -496,7 +544,7 @@ class ComMonitor(tk.Tk):
 
         rendered = sorted(set(current) | set(self._disappeared_at))
         if not rendered:
-            self._empty_lbl.grid(row=2, column=0, columnspan=len(COLS),
+            self._empty_lbl.grid(row=0, column=0, columnspan=len(COLS),
                                  sticky="w", pady=6)
         else:
             for i, dev in enumerate(rendered):
@@ -561,10 +609,11 @@ class ComMonitor(tk.Tk):
                 for c, kw in enumerate(cells):
                     lbl = tk.Label(self._grid, bg=row_bg, font=row_font,
                                    padx=3, pady=1, **kw)
-                    lbl.grid(row=i + 2, column=c, sticky="ew")
+                    lbl.grid(row=i, column=c, sticky="ew")
                     row_w.append(lbl)
                 self._row_widgets.append(row_w)
 
+        self._sync_column_widths()
         self.after(REFRESH_MS, self._refresh)
 
 
