@@ -52,9 +52,11 @@ C_ROW_GONE = "#7a1a1a"   # red peak for vanished-port row flash
 C_GONE     = "#a04848"   # foreground for "gone" status
 C_DIM      = "#555555"   # darkened text for vanished ports
 
-FONT      = ("Consolas", 10)
-FONT_BOLD = ("Consolas", 10, "bold")
-FONT_HDR  = ("Consolas", 9, "bold")
+FONT         = ("Consolas", 10)
+FONT_BOLD    = ("Consolas", 10, "bold")
+FONT_IT      = ("Consolas", 10, "italic")
+FONT_BOLD_IT = ("Consolas", 10, "bold italic")
+FONT_HDR     = ("Consolas", 9, "bold")
 
 ALPHA_OPAQUE = 0.96
 FADE_RAMP_S  = 2.5       # seconds for chrome to fade to fully transparent
@@ -85,16 +87,20 @@ DEFAULT_SETTINGS = {
     "normal_alpha":             ALPHA_OPAQUE, # window opacity (rows keep this)
     "window_x":                 None,         # last-known position
     "window_y":                 None,
+    "custom_names":             {},           # {"VID:PID:SERIAL": user-given name}
 }
 
 
 def load_settings() -> dict:
+    # shallow-copy each default value so callers can mutate nested dicts
+    # (e.g. custom_names) without bleeding into DEFAULT_SETTINGS.
+    merged = {k: (dict(v) if isinstance(v, dict) else v)
+              for k, v in DEFAULT_SETTINGS.items()}
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return dict(DEFAULT_SETTINGS)
-    merged = dict(DEFAULT_SETTINGS)
+        return merged
     for k, v in data.items():
         if k in DEFAULT_SETTINGS:
             merged[k] = v
@@ -132,6 +138,15 @@ def _blend(c1: str, c2: str, t: float) -> str:
     g = int(int(c1[3:5], 16) + (int(c2[3:5], 16) - int(c1[3:5], 16)) * t)
     b = int(int(c1[5:7], 16) + (int(c2[5:7], 16) - int(c1[5:7], 16)) * t)
     return f"#{r:02x}{g:02x}{b:02x}"
+
+
+def _custom_key(vid, pid, serial):
+    """Map key for user-given names. Serial is included verbatim — an empty
+    serial yields a key like "VID:PID:" which still uniquely identifies the
+    "no-serial" variant of that VID:PID. Location is intentionally ignored."""
+    if vid is None or pid is None:
+        return None
+    return f"{vid:04X}:{pid:04X}:{serial or ''}"
 
 
 # ── port-open detection ───────────────────────────────────────────────────────
@@ -191,6 +206,10 @@ class ComMonitor(tk.Tk):
         self._top_active       = self.settings["always_on_top"]
         self._bg_active        = False
         self._last_chrome_alpha = -1.0
+        self._editing_key      = None        # custom_key currently being edited
+        self._edit_entry       = None        # tk.Entry overlaying a serial cell
+        self._edit_lbl         = None        # serial Label hidden during edit
+        self._edit_desc_lbl    = None        # description Label hidden during edit
         self._flash_decay_k = self._compute_flash_decay_k()
 
         # font handles used to pre-compute matching column widths in both grids
@@ -316,14 +335,18 @@ class ComMonitor(tk.Tk):
             col_w[c] = self._f_hdr.measure(name) + cell_pad
 
         for row in self._row_widgets:
-            for c, lbl in enumerate(row):
+            for lbl in row:
                 try:
+                    info = lbl.grid_info()
+                    if int(info.get("columnspan", 1)) > 1:
+                        continue           # spanned cell doesn't constrain its column
+                    col  = int(info["column"])
                     text = lbl.cget("text")
-                except tk.TclError:
+                except (tk.TclError, KeyError, ValueError):
                     continue
                 w = self._f_row.measure(text) + cell_pad
-                if w > col_w[c]:
-                    col_w[c] = w
+                if w > col_w[col]:
+                    col_w[col] = w
 
         for c, w in enumerate(col_w):
             self._hdr_grid.columnconfigure(c, minsize=w)
@@ -390,6 +413,80 @@ class ComMonitor(tk.Tk):
         if m < 60:   return f"{m}m{s:02d}s"
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
+
+    # ── inline edit of custom serial name ─────────────────────────────────────
+    def _begin_serial_edit(self, lbl, key, desc_lbl=None):
+        """Overlay an Entry on the serial cell so the user can type a custom
+        name keyed by VID:PID:Serial. While editing, row rebuilds are paused
+        (see `_editing_key` short-circuit in `_refresh`)."""
+        if self._editing_key is not None:
+            return
+        self._editing_key   = key
+        self._edit_lbl      = lbl
+        self._edit_desc_lbl = desc_lbl
+
+        info = lbl.grid_info()
+        row, col = int(info["row"]), int(info["column"])
+        row_bg   = lbl.cget("bg")
+        current  = self.settings["custom_names"].get(key, "")
+
+        lbl.grid_remove()
+        if desc_lbl is not None:
+            desc_lbl.grid_remove()
+
+        entry = tk.Entry(self._grid, bg=row_bg, fg=C_SER, font=FONT_IT,
+                         bd=0, relief="flat",
+                         insertbackground=C_PORT,
+                         highlightthickness=1,
+                         highlightbackground=C_PORT,
+                         highlightcolor=C_PORT)
+        entry.insert(0, current)
+        entry.grid(row=row, column=col, columnspan=2, sticky="ew")
+        entry.focus_set()
+        entry.select_range(0, tk.END)
+        entry.icursor(tk.END)
+        self._edit_entry = entry
+
+        def commit(_e=None):
+            if self._edit_entry is None:
+                return "break"
+            v  = entry.get().strip()
+            cn = self.settings["custom_names"]
+            if v:
+                cn[key] = v
+            else:
+                cn.pop(key, None)
+            save_settings(self.settings)
+            self._end_serial_edit()
+            return "break"
+
+        def cancel(_e=None):
+            self._end_serial_edit()
+            return "break"
+
+        entry.bind("<Return>",   commit)
+        entry.bind("<Escape>",   cancel)
+        entry.bind("<FocusOut>", commit)
+
+    def _end_serial_edit(self):
+        if self._edit_entry is None:
+            return
+        try:
+            self._edit_entry.destroy()
+        except tk.TclError:
+            pass
+        self._edit_entry = None
+        # restore the hidden labels — the next _refresh tick will rebuild the
+        # row properly (italic + columnspan if a name was set, plain otherwise)
+        for w in (self._edit_lbl, self._edit_desc_lbl):
+            if w is not None:
+                try:
+                    w.grid()
+                except tk.TclError:
+                    pass
+        self._edit_lbl      = None
+        self._edit_desc_lbl = None
+        self._editing_key   = None
 
     # ── settings ──────────────────────────────────────────────────────────────
     def _compute_flash_decay_k(self) -> float:
@@ -535,6 +632,13 @@ class ComMonitor(tk.Tk):
 
         self._initialized = True
 
+        if self._editing_key is not None:
+            # an inline-edit is in progress — leave the rows alone so the
+            # Entry overlay stays put; non-row state (fade, Z-order, port
+            # tracking) above has already updated.
+            self.after(REFRESH_MS, self._refresh)
+            return
+
         # rebuild rows
         for row in self._row_widgets:
             for w in row:
@@ -596,21 +700,45 @@ class ComMonitor(tk.Tk):
                     ser_c  = C_SER
                     desc_c = C_DESC
 
+                custom_key  = _custom_key(info.get("vid"), info.get("pid"),
+                                          info.get("serial_number"))
+                custom_name = (self.settings["custom_names"].get(custom_key)
+                               if custom_key else None)
+
+                # (column, columnspan, label-kwargs)
                 cells = [
-                    dict(text=dev,                    fg=port_c, anchor="w"),
-                    dict(text=f"{vid}:{pid}",         fg=vid_c,  anchor="w"),
-                    dict(text=self._age_str(age_s),   fg=age_c,  anchor="e"),
-                    dict(text="●",                    fg=dot_c,  anchor="center"),
-                    dict(text=stat_t,                 fg=stat_c, anchor="w"),
-                    dict(text=ser_loc,                fg=ser_c,  anchor="w"),
-                    dict(text=desc,                   fg=desc_c, anchor="w"),
+                    (0, 1, dict(text=dev,                  fg=port_c, anchor="w")),
+                    (1, 1, dict(text=f"{vid}:{pid}",       fg=vid_c,  anchor="w")),
+                    (2, 1, dict(text=self._age_str(age_s), fg=age_c,  anchor="e")),
+                    (3, 1, dict(text="●",                  fg=dot_c,  anchor="center")),
+                    (4, 1, dict(text=stat_t,               fg=stat_c, anchor="w")),
                 ]
+                if custom_name:
+                    it_font = FONT_BOLD_IT if row_font is FONT_BOLD else FONT_IT
+                    cells.append((5, 2,
+                        dict(text=custom_name, fg=ser_c, anchor="w", font=it_font)))
+                else:
+                    cells.append((5, 1, dict(text=ser_loc, fg=ser_c,  anchor="w")))
+                    cells.append((6, 1, dict(text=desc,    fg=desc_c, anchor="w")))
+
                 row_w = []
-                for c, kw in enumerate(cells):
-                    lbl = tk.Label(self._grid, bg=row_bg, font=row_font,
-                                   padx=3, pady=1, **kw)
-                    lbl.grid(row=i, column=c, sticky="ew")
+                serial_lbl = None
+                desc_lbl   = None
+                for col, span, kw in cells:
+                    kw.setdefault("font", row_font)
+                    lbl = tk.Label(self._grid, bg=row_bg, padx=3, pady=1, **kw)
+                    lbl.grid(row=i, column=col, columnspan=span, sticky="ew")
                     row_w.append(lbl)
+                    if col == 5:
+                        serial_lbl = lbl
+                    elif col == 6:
+                        desc_lbl = lbl
+
+                if serial_lbl is not None and custom_key is not None:
+                    serial_lbl.bind("<Double-Button-1>",
+                        lambda _e, k=custom_key, sw=serial_lbl, dw=desc_lbl:
+                            self._begin_serial_edit(sw, k, dw))
+
                 self._row_widgets.append(row_w)
 
         self._sync_column_widths()
