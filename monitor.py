@@ -88,12 +88,15 @@ DEFAULT_SETTINGS = {
     "normal_alpha":             ALPHA_OPAQUE, # window opacity (rows keep this)
     "window_x":                 None,         # last-known position
     "window_y":                 None,
-    "custom_names":             {},           # {"VID:PID:SERIAL": user-given name}
     "terminal_size":            "640x400",    # remembered terminal WxH
     "terminal_always_on_top":   True,         # terminal pin — independent of main window
-    "port_settings":            {},           # {"VID:PID:SERIAL": port-specific serial config}
+    # per-device config keyed by "VID:PID:SERIAL"; each entry may carry a
+    # "name" and/or serial settings — either alone is fine.
+    "device_settings":          {},
 }
 
+# serial/terminal portion of a device entry (the "name" key lives alongside
+# these but is not a serial default).
 DEFAULT_PORT_SETTINGS = {
     "baud":        115200,
     "data_bits":   8,
@@ -111,7 +114,7 @@ TERM_MIN_H    = 160                           # minimum terminal height
 
 def load_settings() -> dict:
     # shallow-copy each default value so callers can mutate nested dicts
-    # (e.g. custom_names) without bleeding into DEFAULT_SETTINGS.
+    # (e.g. device_settings) without bleeding into DEFAULT_SETTINGS.
     merged = {k: (dict(v) if isinstance(v, dict) else v)
               for k, v in DEFAULT_SETTINGS.items()}
     try:
@@ -440,13 +443,31 @@ class ComMonitor(tk.Tk):
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
 
-    # ── terminal open / wait ──────────────────────────────────────────────────
+    # ── per-device settings (name + serial config, keyed by VID:PID:Serial) ──
     def _port_settings_for(self, key) -> dict:
-        """Merge DEFAULT_PORT_SETTINGS with the per-port overrides (if any)."""
+        """Merge DEFAULT_PORT_SETTINGS with the device's serial overrides."""
         s = dict(DEFAULT_PORT_SETTINGS)
         if key is not None:
-            s.update(self.settings.get("port_settings", {}).get(key, {}))
+            s.update(self.settings.get("device_settings", {}).get(key, {}))
+        s.pop("name", None)                             # name isn't a serial setting
         return s
+
+    def _custom_name_for(self, key) -> str:
+        if key is None:
+            return ""
+        return self.settings.get("device_settings", {}).get(key, {}).get("name", "")
+
+    def _set_custom_name(self, key, name):
+        """Store/clear a device's display name, pruning empty entries."""
+        if key is None:
+            return
+        dev = self.settings.setdefault("device_settings", {})
+        if name:
+            dev.setdefault(key, {})["name"] = name
+        elif key in dev:
+            dev[key].pop("name", None)
+            if not dev[key]:                            # nothing left → drop entry
+                del dev[key]
 
     def _on_status_click(self, dev, key):
         """Click on a row's status cell. Single-terminal policy: any open
@@ -504,7 +525,7 @@ class ComMonitor(tk.Tk):
         info = lbl.grid_info()
         row, col = int(info["row"]), int(info["column"])
         row_bg   = lbl.cget("bg")
-        current  = self.settings["custom_names"].get(key, "")
+        current  = self._custom_name_for(key)
 
         lbl.grid_remove()
         if desc_lbl is not None:
@@ -526,12 +547,8 @@ class ComMonitor(tk.Tk):
         def commit(_e=None):
             if self._edit_entry is None:
                 return "break"
-            v  = entry.get().strip()
-            cn = self.settings["custom_names"]
-            if v:
-                cn[key] = v
-            else:
-                cn.pop(key, None)
+            v = entry.get().strip()
+            self._set_custom_name(key, v)
             save_settings(self.settings)
             self._end_serial_edit()
             return "break"
@@ -822,8 +839,7 @@ class ComMonitor(tk.Tk):
 
                 custom_key  = _custom_key(info.get("vid"), info.get("pid"),
                                           info.get("serial_number"))
-                custom_name = (self.settings["custom_names"].get(custom_key)
-                               if custom_key else None)
+                custom_name = self._custom_name_for(custom_key)
 
                 # (column, columnspan, label-kwargs)
                 cells = [
@@ -1191,7 +1207,7 @@ class Terminal(tk.Toplevel):
         """e.g. 'COM7 - MyBoard - 115200 8N1', or without the name if unset."""
         s = self.parent._port_settings_for(self.key)
         params = f"{s['baud']} {s['data_bits']}{s['parity']}{s['stop_bits']}"
-        name = self.parent.settings["custom_names"].get(self.key, "").strip()
+        name = self.parent._custom_name_for(self.key).strip()
         parts = [self.device] + ([name] if name else []) + [params]
         return " - ".join(parts)
 
@@ -1519,7 +1535,10 @@ class PortSettingsDialog(tk.Toplevel):
         except (tk.TclError, ValueError): pass
 
         settings = self.terminal.parent.settings
-        settings.setdefault("port_settings", {})[self.terminal.key] = new
+        # merge into the device entry so a custom "name" set elsewhere survives
+        entry = settings.setdefault("device_settings", {}) \
+                        .setdefault(self.terminal.key, {})
+        entry.update(new)
         save_settings(settings)
         self.terminal.reconnect()
         self.destroy()
