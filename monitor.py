@@ -161,15 +161,6 @@ def _blend(c1: str, c2: str, t: float) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def _custom_key(vid, pid, serial):
-    """Map key for user-given names. Serial is included verbatim — an empty
-    serial yields a key like "VID:PID:" which still uniquely identifies the
-    "no-serial" variant of that VID:PID. Location is intentionally ignored."""
-    if vid is None or pid is None:
-        return None
-    return f"{vid:04X}:{pid:04X}:{serial or ''}"
-
-
 # ── port-open detection ───────────────────────────────────────────────────────
 def _is_open_win32(device: str) -> bool:
     path = r"\\.\ "[:-1] + device
@@ -201,6 +192,85 @@ def is_open(device: str) -> bool:
     return _is_open_win32(device) if HAS_WIN32 else _is_open_fallback(device)
 
 
+# ── per-device record ─────────────────────────────────────────────────────────
+class Device:
+    """One COM port currently or recently seen. Bundles its identity/data
+    (from list_ports), transient UI state (first-seen / flash / gone timers),
+    and connection state. Persisted config (name + serial settings) lives in
+    settings["device_settings"] keyed by VID:PID:Serial and is reached through
+    the owning ComMonitor — this object is the single access point for it."""
+
+    def __init__(self, app: "ComMonitor", dev_id: str, info: dict, now: float):
+        self.app  = app
+        self.id   = dev_id                  # e.g. "COM7"
+        self.info = info                    # vid/pid/description/serial_number/location
+        # transient UI state
+        self.first_seen     = now
+        self.flash_start: "float | None"    = None   # None = not flashing
+        self.disappeared_at: "float | None" = None   # None = present
+        # connection state, authoritative while a Terminal is bound to us
+        self.conn_state = "disconnected"    # "connected" | "waiting" | "disconnected"
+
+    # ── identity / data ──
+    @property
+    def present(self) -> bool:        return self.disappeared_at is None
+    @property
+    def vid(self):                    return self.info.get("vid")
+    @property
+    def pid(self):                    return self.info.get("pid")
+    @property
+    def serial_number(self) -> str:   return self.info.get("serial_number", "")
+    @property
+    def location(self) -> str:        return self.info.get("location", "")
+    @property
+    def description(self) -> str:     return self.info.get("description", "")
+    @property
+    def custom_key(self):
+        """Settings key for this device's config. Serial is included verbatim —
+        an empty serial yields "VID:PID:" which still uniquely identifies the
+        "no-serial" variant of that VID:PID. Location is intentionally ignored."""
+        if self.vid is None or self.pid is None:
+            return None
+        return f"{self.vid:04X}:{self.pid:04X}:{self.serial_number or ''}"
+
+    # ── persisted config (this device's entry in settings["device_settings"]) ──
+    def _config(self) -> dict:
+        """The stored config dict for this device, or {} if none/unkeyable.
+        Returns the live dict from settings so reads see edits immediately."""
+        k = self.custom_key
+        return self.app.settings.get("device_settings", {}).get(k, {}) if k else {}
+
+    @property
+    def name(self) -> str:
+        return self._config().get("name", "")
+
+    def port_settings(self) -> dict:
+        """DEFAULT_PORT_SETTINGS merged with this device's serial overrides."""
+        s = dict(DEFAULT_PORT_SETTINGS)
+        s.update(self._config())
+        s.pop("name", None)                             # name isn't a serial setting
+        return s
+
+    def update_config(self, **fields):
+        """Merge fields into this device's stored config, pruning empties.
+        Pass name="" (or any blank value) to drop that key."""
+        k = self.custom_key
+        if k is None:
+            return
+        store = self.app.settings.setdefault("device_settings", {})
+        entry = store.setdefault(k, {})
+        for kk, vv in fields.items():
+            if vv == "" or vv is None:
+                entry.pop(kk, None)
+            else:
+                entry[kk] = vv
+        if not entry:                                   # nothing left → drop entry
+            store.pop(k, None)
+
+    def set_name(self, name: str):
+        self.update_config(name=name)
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 class ComMonitor(tk.Tk):
     def __init__(self):
@@ -212,10 +282,7 @@ class ComMonitor(tk.Tk):
         self.attributes("-alpha", self.settings["normal_alpha"])
         self.configure(bg=C_BG)
 
-        self._first_seen:     dict[str, float] = {}   # device → first-seen time
-        self._flash_start:    dict[str, float] = {}   # device → flash start time (new arrivals only)
-        self._disappeared_at: dict[str, float] = {}   # device → time it vanished
-        self._port_info:      dict[str, dict]  = {}   # device → last-known port info
+        self.devices: dict[str, Device] = {}          # COM id → Device (present or recently gone)
         self._initialized  = False                    # skip flash for ports present at startup
         self._row_widgets: list[list[tk.Widget]] = []
         self._drag_ox = self._drag_oy = 0
@@ -443,60 +510,34 @@ class ComMonitor(tk.Tk):
         h, m = divmod(m, 60)
         return f"{h}h{m:02d}m"
 
-    # ── per-device settings (name + serial config, keyed by VID:PID:Serial) ──
-    def _port_settings_for(self, key) -> dict:
-        """Merge DEFAULT_PORT_SETTINGS with the device's serial overrides."""
-        s = dict(DEFAULT_PORT_SETTINGS)
-        if key is not None:
-            s.update(self.settings.get("device_settings", {}).get(key, {}))
-        s.pop("name", None)                             # name isn't a serial setting
-        return s
-
-    def _custom_name_for(self, key) -> str:
-        if key is None:
-            return ""
-        return self.settings.get("device_settings", {}).get(key, {}).get("name", "")
-
-    def _set_custom_name(self, key, name):
-        """Store/clear a device's display name, pruning empty entries."""
-        if key is None:
-            return
-        dev = self.settings.setdefault("device_settings", {})
-        if name:
-            dev.setdefault(key, {})["name"] = name
-        elif key in dev:
-            dev[key].pop("name", None)
-            if not dev[key]:                            # nothing left → drop entry
-                del dev[key]
-
-    def _on_status_click(self, dev, key):
+    def _on_status_click(self, device: Device):
         """Click on a row's status cell. Single-terminal policy: any open
         terminal is closed before opening a different port."""
-        if self._terminal is not None and self._terminal.device == dev:
+        if self._terminal is not None and self._terminal.dev is device:
             self._terminal.lift()
             self._terminal.focus_set()
             return
-        if self._wanted_dev == dev:
+        if self._wanted_dev == device.id:
             self._wanted_dev = None                     # cancel wait
             return
         # free and present right now → open immediately
-        if dev in self._known_ports and not is_open(dev):
-            self._open_terminal(dev, key)
+        if device.present and not is_open(device.id):
+            self._open_terminal(device)
             return
         # OPEN (held elsewhere) or gone → queue and grab it as soon as it's
         # present and free again
-        self._wanted_dev = dev
+        self._wanted_dev = device.id
 
-    def _open_terminal(self, dev, key):
+    def _open_terminal(self, device: Device):
         if self._terminal is not None:
             self._terminal._close_quiet()               # swap: close current first
             self._terminal = None
         self._wanted_dev = None
         try:
-            self._terminal = Terminal(self, dev, key)
+            self._terminal = Terminal(self, device)
             self._terminal.lift()
         except Exception as e:                          # noqa: BLE001
-            print(f"Failed to open terminal for {dev}: {e}")
+            print(f"Failed to open terminal for {device.id}: {e}")
             self._terminal = None
 
     def _terminal_closed(self, term):
@@ -504,28 +545,21 @@ class ComMonitor(tk.Tk):
         if self._terminal is term:
             self._terminal = None
 
-    def _terminal_state_for(self, dev):
-        """The open terminal's connection state for `dev`, else None.
-        Single-terminal policy means at most one device is ever bound."""
-        if self._terminal is not None and self._terminal.device == dev:
-            return self._terminal.state
-        return None
-
     # ── inline edit of custom serial name ─────────────────────────────────────
-    def _begin_serial_edit(self, lbl, key, desc_lbl=None):
+    def _begin_serial_edit(self, lbl, device: Device, desc_lbl=None):
         """Overlay an Entry on the serial cell so the user can type a custom
         name keyed by VID:PID:Serial. While editing, row rebuilds are paused
         (see `_editing_key` short-circuit in `_refresh`)."""
         if self._editing_key is not None:
             return
-        self._editing_key   = key
+        self._editing_key   = device.custom_key
         self._edit_lbl      = lbl
         self._edit_desc_lbl = desc_lbl
 
         info = lbl.grid_info()
         row, col = int(info["row"]), int(info["column"])
         row_bg   = lbl.cget("bg")
-        current  = self._custom_name_for(key)
+        current  = device.name
 
         lbl.grid_remove()
         if desc_lbl is not None:
@@ -548,7 +582,7 @@ class ComMonitor(tk.Tk):
             if self._edit_entry is None:
                 return "break"
             v = entry.get().strip()
-            self._set_custom_name(key, v)
+            device.set_name(v)
             save_settings(self.settings)
             self._end_serial_edit()
             return "break"
@@ -631,59 +665,58 @@ class ComMonitor(tk.Tk):
         now   = time.time()
         ports = sorted(serial.tools.list_ports.comports(), key=lambda p: p.device)
 
-        # update registries — active ports
+        # update device records — active ports
         current = {p.device for p in ports}
         for p in ports:
-            self._port_info[p.device] = {
+            info = {
                 "vid": p.vid, "pid": p.pid,
                 "description":   p.description or "",
                 "serial_number": p.serial_number or "",
                 "location":      p.location or "",
             }
-            if p.device not in self._first_seen:
-                self._first_seen[p.device] = now
+            d = self.devices.get(p.device)
+            if d is None:                       # first time we've seen this port
+                d = self.devices[p.device] = Device(self, p.device, info, now)
                 if self._initialized:           # don't flash ports seen at startup
                     # shift back so first render lands at peak brightness, not t=0
-                    self._flash_start[p.device] = now - FLASH_ATTACK_S
-            if p.device in self._disappeared_at:
-                # port came back — clear gone marker and re-flash as a new arrival
-                del self._disappeared_at[p.device]
-                self._flash_start[p.device] = now - FLASH_ATTACK_S
+                    d.flash_start = now - FLASH_ATTACK_S
+            else:
+                d.info = info
+                if not d.present:               # port came back → re-flash as new
+                    d.disappeared_at = None
+                    d.flash_start = now - FLASH_ATTACK_S
 
         # mark newly-vanished ports (skip if user has disabled the feature)
         if self.settings["show_removed_s"] > 0:
-            for dev in list(self._first_seen):
-                if dev not in current and dev not in self._disappeared_at:
-                    self._disappeared_at[dev] = now
-                    self._flash_start.pop(dev, None)
+            for d in self.devices.values():
+                if d.id not in current and d.present:
+                    d.disappeared_at = now
+                    d.flash_start = None
 
-        # expire vanished ports past the configured display duration
+        # expire/purge: drop records that are gone too long, or absent entirely.
+        # Keep the bound terminal's device alive even once its row expires.
         show_removed = self.settings["show_removed_s"]
-        for dev, t in list(self._disappeared_at.items()):
-            if show_removed == 0 or (now - t) > show_removed:
-                del self._disappeared_at[dev]
-
-        # purge registries for devices that are neither active nor displayed-as-gone
-        for dev in list(self._first_seen):
-            if dev not in current and dev not in self._disappeared_at:
-                self._first_seen.pop(dev, None)
-                self._flash_start.pop(dev, None)
-                self._port_info.pop(dev, None)
+        term_dev = self._terminal.dev if self._terminal is not None else None
+        for dev_id, d in list(self.devices.items()):
+            if d.id in current or d is term_dev:
+                continue
+            expired = (d.disappeared_at is None
+                       or show_removed == 0
+                       or (now - d.disappeared_at) > show_removed)
+            if expired:
+                del self.devices[dev_id]
 
         # a port we're waiting for: grab it as soon as it's present AND free.
         # We keep waiting through 'gone'/'OPEN' until then (click again to cancel).
-        if self._wanted_dev is not None:
-            dev_w = self._wanted_dev
-            if dev_w in current and not is_open(dev_w):
-                info = self._port_info.get(dev_w, {})
-                key  = _custom_key(info.get("vid"), info.get("pid"),
-                                   info.get("serial_number"))
-                self._open_terminal(dev_w, key)
+        if self._wanted_dev is not None and self._wanted_dev in self.devices:
+            d = self.devices[self._wanted_dev]
+            if d.present and not is_open(d.id):
+                self._open_terminal(d)
 
         # reconcile the open terminal's connection with device presence
         t = self._terminal
         if t is not None:
-            tdev = t.device
+            tdev = t.dev.id
             if t.state == "connected" and tdev not in current:
                 # device unplugged
                 t._close_serial()
@@ -770,33 +803,32 @@ class ComMonitor(tk.Tk):
         self._row_widgets.clear()
         self._empty_lbl.grid_forget()
 
-        rendered = sorted(set(current) | set(self._disappeared_at))
-        if not rendered:
+        visible = [d for d in self.devices.values()
+                   if d.present or (show_removed != 0
+                                    and now - d.disappeared_at <= show_removed)]
+        visible.sort(key=lambda d: d.id)
+        if not visible:
             self._empty_lbl.grid(row=0, column=0, columnspan=len(COLS),
                                  sticky="w", pady=6)
         else:
-            for i, dev in enumerate(rendered):
-                gone = dev in self._disappeared_at
-                info = self._port_info.get(dev, {})
+            for i, d in enumerate(visible):
+                gone = not d.present
 
-                vid = f"{info.get('vid'):04X}" if info.get("vid") is not None else "----"
-                pid = f"{info.get('pid'):04X}" if info.get("pid") is not None else "----"
+                vid = f"{d.vid:04X}" if d.vid is not None else "----"
+                pid = f"{d.pid:04X}" if d.pid is not None else "----"
 
-                ser_loc = " / ".join(filter(None, [info.get("serial_number", ""),
-                                                   info.get("location", "")])) or "—"
-                desc = info.get("description", "")
-                if desc == dev:
-                    desc = ""
+                ser_loc = " / ".join(filter(None, [d.serial_number,
+                                                   d.location])) or "—"
+                desc = "" if d.description == d.id else d.description
 
                 if gone:
-                    age_s      = now - self._disappeared_at[dev]
+                    age_s      = now - d.disappeared_at
                     brightness = _flash_brightness(age_s, self._flash_decay_k)
                     row_bg     = _blend(C_ROW_GONE, C_BG, 1.0 - brightness)
                     row_font   = FONT
                     dot_c      = C_GONE
                     age_c      = C_DIM
-                    if (self._wanted_dev == dev
-                            or self._terminal_state_for(dev) == "waiting"):
+                    if self._wanted_dev == d.id or d.conn_state == "waiting":
                         stat_t, stat_c = "waiting", C_WAIT
                     else:
                         stat_t, stat_c = "gone", C_GONE
@@ -805,16 +837,16 @@ class ComMonitor(tk.Tk):
                     ser_c      = C_DIM
                     desc_c     = C_DIM
                 else:
-                    age_s    = now - self._first_seen[dev]
-                    tstate   = self._terminal_state_for(dev)
+                    age_s = now - d.first_seen
+                    cs    = d.conn_state
                     # our terminal owns the port only while actually connected;
                     # waiting/disconnected releases it so the row reflects that
-                    occupied = (tstate == "connected"
-                                or (tstate is None and is_open(dev)))
-                    waiting  = (tstate == "waiting"
-                                or (tstate is None and self._wanted_dev == dev))
+                    occupied = (cs == "connected"
+                                or (cs == "disconnected" and is_open(d.id)))
+                    waiting  = (cs == "waiting"
+                                or (cs == "disconnected" and self._wanted_dev == d.id))
 
-                    flash_t = now - self._flash_start[dev] if dev in self._flash_start else None
+                    flash_t = now - d.flash_start if d.flash_start is not None else None
                     if flash_t is not None:
                         brightness = _flash_brightness(flash_t, self._flash_decay_k)
                         row_bg     = _blend(C_ROW_FLASH, C_BG, 1.0 - brightness)
@@ -837,13 +869,11 @@ class ComMonitor(tk.Tk):
                     ser_c  = C_SER
                     desc_c = C_DESC
 
-                custom_key  = _custom_key(info.get("vid"), info.get("pid"),
-                                          info.get("serial_number"))
-                custom_name = self._custom_name_for(custom_key)
+                custom_name = d.name
 
                 # (column, columnspan, label-kwargs)
                 cells = [
-                    (0, 1, dict(text=dev,                  fg=port_c, anchor="w")),
+                    (0, 1, dict(text=d.id,                 fg=port_c, anchor="w")),
                     (1, 1, dict(text=f"{vid}:{pid}",       fg=vid_c,  anchor="w")),
                     (2, 1, dict(text=self._age_str(age_s), fg=age_c,  anchor="e")),
                     (3, 1, dict(text="●",                  fg=dot_c,  anchor="center")),
@@ -873,18 +903,17 @@ class ComMonitor(tk.Tk):
                     elif col == 6:
                         desc_lbl = lbl
 
-                if serial_lbl is not None and custom_key is not None:
+                if serial_lbl is not None and d.custom_key is not None:
                     serial_lbl.bind("<Double-Button-1>",
-                        lambda _e, k=custom_key, sw=serial_lbl, dw=desc_lbl:
-                            self._begin_serial_edit(sw, k, dw))
+                        lambda _e, dd=d, sw=serial_lbl, dw=desc_lbl:
+                            self._begin_serial_edit(sw, dd, dw))
 
                 # status cell drives terminal open / wait / cancel — clickable
                 # in every state (free → open now; OPEN/gone → queue the wait)
                 if status_lbl is not None:
                     status_lbl.configure(cursor="hand2")
                     status_lbl.bind("<Button-1>",
-                        lambda _e, d=dev, k=custom_key:
-                            self._on_status_click(d, k))
+                        lambda _e, dd=d: self._on_status_click(dd))
 
                 self._row_widgets.append(row_w)
 
@@ -1087,20 +1116,16 @@ class SettingsDialog(tk.Toplevel):
 
 # ── terminal ──────────────────────────────────────────────────────────────────
 class Terminal(tk.Toplevel):
-    def __init__(self, parent: ComMonitor, device: str, key):
+    def __init__(self, parent: ComMonitor, device: "Device"):
         super().__init__(parent)
         self.parent   = parent
-        self.device   = device
-        self.key      = key
+        self.dev      = device
         self.serial: "serial.Serial | None" = None
         self._poll_id = None
         self._closing = False
-        # "connected" = serial open; "waiting" = want it, reconnect when the
-        # device returns; "disconnected" = user closed it, no auto-reconnect.
-        self.state    = "disconnected"
         self._conn_btn = None
 
-        self.title(f"Terminal — {device}")
+        self.title(f"Terminal — {device.id}")
         self.configure(bg=C_HDR)                        # exposed margin = subtle border
         self.overrideredirect(True)
         self._topmost = bool(parent.settings.get("terminal_always_on_top", True))
@@ -1205,10 +1230,10 @@ class Terminal(tk.Toplevel):
     # ── title bar text ──────────────────────────────────────────────────────
     def _title_text(self) -> str:
         """e.g. 'COM7 - MyBoard - 115200 8N1', or without the name if unset."""
-        s = self.parent._port_settings_for(self.key)
+        s = self.dev.port_settings()
         params = f"{s['baud']} {s['data_bits']}{s['parity']}{s['stop_bits']}"
-        name = self.parent._custom_name_for(self.key).strip()
-        parts = [self.device] + ([name] if name else []) + [params]
+        name = self.dev.name.strip()
+        parts = [self.dev.id] + ([name] if name else []) + [params]
         return " - ".join(parts)
 
     def _refresh_title(self):
@@ -1216,6 +1241,16 @@ class Terminal(tk.Toplevel):
             self._title.configure(text=self._title_text())
 
     # ── connect / disconnect state machine ──────────────────────────────────
+    # connection state lives on the Device ("connected"/"waiting"/"disconnected")
+    # so the main window can read it straight off the row's device.
+    @property
+    def state(self) -> str:
+        return self.dev.conn_state
+
+    @state.setter
+    def state(self, st: str):
+        self.dev.conn_state = st
+
     def _set_state(self, st: str):
         self.state = st
         self._update_conn_btn()
@@ -1293,10 +1328,10 @@ class Terminal(tk.Toplevel):
         self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _open_serial(self) -> bool:
-        s = self.parent._port_settings_for(self.key)
+        s = self.dev.port_settings()
         try:
             self.serial = serial.Serial(
-                self.device,
+                self.dev.id,
                 baudrate=s["baud"],
                 bytesize=s["data_bits"],
                 parity=s["parity"],
@@ -1342,7 +1377,7 @@ class Terminal(tk.Toplevel):
         if self.serial is None:
             self._info("[not connected]")
             return "break"
-        s = self.parent._port_settings_for(self.key)
+        s = self.dev.port_settings()
         try:
             self.serial.write((line + s["line_ending"])
                               .encode("utf-8", errors="replace"))
@@ -1380,8 +1415,7 @@ class Terminal(tk.Toplevel):
         self._refresh_title()
 
     def reconnect_on_unplug(self) -> bool:
-        return bool(self.parent._port_settings_for(self.key)
-                    .get("reconnect_on_unplug", True))
+        return bool(self.dev.port_settings().get("reconnect_on_unplug", True))
 
     def _position_above_main(self):
         try:
@@ -1406,6 +1440,7 @@ class Terminal(tk.Toplevel):
         if self._closing:
             return
         self._closing = True
+        self.dev.conn_state = "disconnected"            # release the device's state
         save_settings(self.parent.settings)             # persist size
         if self._poll_id is not None:
             try:
@@ -1450,7 +1485,7 @@ class PortSettingsDialog(tk.Toplevel):
         self.bind("<Escape>", lambda _: self.destroy())
 
     def _build(self):
-        s   = self.terminal.parent._port_settings_for(self.terminal.key)
+        s   = self.terminal.dev.port_settings()
         pad = dict(padx=8, pady=4)
 
         frm = tk.Frame(self, bg=C_BG)
@@ -1511,7 +1546,7 @@ class PortSettingsDialog(tk.Toplevel):
                   padx=14, pady=3).pack(side=tk.RIGHT)
 
     def _save(self):
-        if self.terminal.key is None:
+        if self.terminal.dev.custom_key is None:
             self.destroy()
             return
         new = dict(DEFAULT_PORT_SETTINGS)
@@ -1534,12 +1569,9 @@ class PortSettingsDialog(tk.Toplevel):
         try: new["reconnect_on_unplug"] = bool(self.var_reconn.get())
         except (tk.TclError, ValueError): pass
 
-        settings = self.terminal.parent.settings
-        # merge into the device entry so a custom "name" set elsewhere survives
-        entry = settings.setdefault("device_settings", {}) \
-                        .setdefault(self.terminal.key, {})
-        entry.update(new)
-        save_settings(settings)
+        # merge serial keys into the device's entry (a "name" set elsewhere survives)
+        self.terminal.dev.update_config(**new)
+        save_settings(self.terminal.parent.settings)
         self.terminal.reconnect()
         self.destroy()
 
