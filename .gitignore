@@ -1,2 +1,4 @@
 settings.json
 uv.lock
+.venv
+__pycache__

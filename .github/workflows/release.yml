@@ -13,15 +13,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
         with:
-          python-version: "3.12"
+          enable-cache: true
 
       - name: Install dependencies
-        run: pip install pyserial pywin32 pyinstaller
+        run: uv sync --locked --dev
 
       - name: Build exe
-        run: pyinstaller --onefile --windowed --name com_monitor monitor.py
+        run: uv run pyinstaller --onefile --windowed --name com_monitor monitor.py
 
       - name: Create release
         uses: softprops/action-gh-release@v2
