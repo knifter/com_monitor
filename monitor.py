@@ -100,6 +100,7 @@ DEFAULT_PORT_SETTINGS = {
     "parity":      "N",                       # N/E/O/M/S
     "stop_bits":   1,                         # 1, 1.5, 2
     "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
+    "reconnect_on_unplug": True,              # keep terminal open & reconnect when device returns
 }
 
 TERM_POLL_MS  = 50                            # serial-read poll cadence
@@ -457,11 +458,13 @@ class ComMonitor(tk.Tk):
         if self._wanted_dev == dev:
             self._wanted_dev = None                     # cancel wait
             return
-        if is_open(dev):
-            # someone else has it — line up to grab it as soon as it frees
-            self._wanted_dev = dev
+        # free and present right now → open immediately
+        if dev in self._known_ports and not is_open(dev):
+            self._open_terminal(dev, key)
             return
-        self._open_terminal(dev, key)
+        # OPEN (held elsewhere) or gone → queue and grab it as soon as it's
+        # present and free again
+        self._wanted_dev = dev
 
     def _open_terminal(self, dev, key):
         if self._terminal is not None:
@@ -643,16 +646,32 @@ class ComMonitor(tk.Tk):
                 self._flash_start.pop(dev, None)
                 self._port_info.pop(dev, None)
 
-        # if a port we're waiting for has freed up, grab it now
+        # a port we're waiting for: grab it as soon as it's present AND free.
+        # We keep waiting through 'gone'/'OPEN' until then (click again to cancel).
         if self._wanted_dev is not None:
-            if self._wanted_dev not in current:
-                self._wanted_dev = None                 # device gone, drop wait
-            elif not is_open(self._wanted_dev):
-                dev_w = self._wanted_dev
-                info  = self._port_info.get(dev_w, {})
-                key   = _custom_key(info.get("vid"), info.get("pid"),
-                                    info.get("serial_number"))
+            dev_w = self._wanted_dev
+            if dev_w in current and not is_open(dev_w):
+                info = self._port_info.get(dev_w, {})
+                key  = _custom_key(info.get("vid"), info.get("pid"),
+                                   info.get("serial_number"))
                 self._open_terminal(dev_w, key)
+
+        # open terminal whose device just unplugged / came back
+        if self._terminal is not None:
+            tdev = self._terminal.device
+            was_present = tdev in self._known_ports
+            if was_present and tdev not in current:
+                # unplugged: close, or keep open to reconnect per device setting
+                if self._terminal.reconnect_on_unplug():
+                    self._terminal._info("[device removed — waiting for it to return]")
+                else:
+                    self._terminal._close_quiet()
+                    self._terminal = None
+            elif (tdev in current and not was_present
+                  and self._terminal.serial is None
+                  and not is_open(tdev)):
+                # came back while we held the window open → reconnect
+                self._terminal.reconnect()
 
         # port changes lift the window pair and pin them on top for one
         # interaction timeout so the user actually notices the connect/disconnect.
@@ -751,8 +770,10 @@ class ComMonitor(tk.Tk):
                     row_font   = FONT
                     dot_c      = C_GONE
                     age_c      = C_DIM
-                    stat_t     = "gone"
-                    stat_c     = C_GONE
+                    if self._wanted_dev == dev:
+                        stat_t, stat_c = "waiting", C_WAIT
+                    else:
+                        stat_t, stat_c = "gone", C_GONE
                     port_c     = C_DIM
                     vid_c      = C_DIM
                     ser_c      = C_DIM
@@ -762,8 +783,7 @@ class ComMonitor(tk.Tk):
                     ours     = (self._terminal is not None
                                 and self._terminal.device == dev)
                     occupied = ours or is_open(dev)
-                    waiting  = (not ours and not is_open(dev)
-                                and self._wanted_dev == dev)
+                    waiting  = (not ours and self._wanted_dev == dev)
 
                     flash_t = now - self._flash_start[dev] if dev in self._flash_start else None
                     if flash_t is not None:
@@ -830,8 +850,9 @@ class ComMonitor(tk.Tk):
                         lambda _e, k=custom_key, sw=serial_lbl, dw=desc_lbl:
                             self._begin_serial_edit(sw, k, dw))
 
-                # status cell drives terminal open / wait / cancel
-                if status_lbl is not None and not gone:
+                # status cell drives terminal open / wait / cancel — clickable
+                # in every state (free → open now; OPEN/gone → queue the wait)
+                if status_lbl is not None:
                     status_lbl.configure(cursor="hand2")
                     status_lbl.bind("<Button-1>",
                         lambda _e, d=dev, k=custom_key:
@@ -1285,6 +1306,10 @@ class Terminal(tk.Toplevel):
         self._open_serial()
         self._refresh_title()
 
+    def reconnect_on_unplug(self) -> bool:
+        return bool(self.parent._port_settings_for(self.key)
+                    .get("reconnect_on_unplug", True))
+
     def _position_above_main(self):
         try:
             x = self.parent.winfo_rootx()
@@ -1393,6 +1418,14 @@ class PortSettingsDialog(tk.Toplevel):
         spin(4, self.var_le, tuple(self.LE_TO_LABEL.values()),
              self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
 
+        self.var_reconn = tk.BooleanVar(value=s["reconnect_on_unplug"])
+        tk.Checkbutton(frm, text="Reconnect on unplug",
+                       variable=self.var_reconn,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
         tk.Button(btns, text="Cancel", command=self.destroy,
@@ -1424,6 +1457,8 @@ class PortSettingsDialog(tk.Toplevel):
         except (tk.TclError, ValueError): pass
         try: new["line_ending"] = self.LABEL_TO_LE.get(
                                     self.var_le.get(), "\r\n")
+        except (tk.TclError, ValueError): pass
+        try: new["reconnect_on_unplug"] = bool(self.var_reconn.get())
         except (tk.TclError, ValueError): pass
 
         settings = self.terminal.parent.settings
