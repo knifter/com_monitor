@@ -88,7 +88,7 @@ DEFAULT_SETTINGS = {
     "normal_alpha":             ALPHA_OPAQUE, # window opacity (rows keep this)
     "window_x":                 None,         # last-known position
     "window_y":                 None,
-    "terminal_size":            "640x400",    # remembered terminal WxH
+    "terminal_size":            "640x400",    # default terminal WxH (per-device geometry overrides)
     "terminal_always_on_top":   True,         # terminal pin — independent of main window
     # per-device config keyed by "VID:PID:SERIAL"; each entry may carry a
     # "name" and/or serial settings — either alone is fine.
@@ -210,6 +210,8 @@ class Device:
         self.disappeared_at: "float | None" = None   # None = present
         # connection state, authoritative while a Terminal is bound to us
         self.conn_state = "disconnected"    # "connected" | "waiting" | "disconnected"
+        self.terminal: "Terminal | None" = None   # this device's open terminal, if any
+        self.wanted = False                 # queued to open a terminal once free
 
     # ── identity / data ──
     @property
@@ -248,8 +250,17 @@ class Device:
         """DEFAULT_PORT_SETTINGS merged with this device's serial overrides."""
         s = dict(DEFAULT_PORT_SETTINGS)
         s.update(self._config())
-        s.pop("name", None)                             # name isn't a serial setting
+        for k in ("name", "geometry"):                  # non-serial config keys
+            s.pop(k, None)
         return s
+
+    @property
+    def geometry(self) -> "str | None":
+        """Remembered terminal geometry "WxH+X+Y" for this device, or None."""
+        return self._config().get("geometry")
+
+    def save_geometry(self, geo: str):
+        self.update_config(geometry=geo)
 
     def update_config(self, **fields):
         """Merge fields into this device's stored config, pruning empties.
@@ -298,8 +309,7 @@ class ComMonitor(tk.Tk):
         self._edit_entry       = None        # tk.Entry overlaying a serial cell
         self._edit_lbl         = None        # serial Label hidden during edit
         self._edit_desc_lbl    = None        # description Label hidden during edit
-        self._terminal         = None        # only one Terminal open at a time
-        self._wanted_dev       = None        # device we want to open when it frees up
+        # per-device terminals + open-when-free intent live on each Device
         self._flash_decay_k = self._compute_flash_decay_k()
 
         # font handles used to pre-compute matching column widths in both grids
@@ -463,21 +473,25 @@ class ComMonitor(tk.Tk):
         self._update_alpha()
 
     # ── paired Z-order helpers ───────────────────────────────────────────────
+    def _terminals(self):
+        """Every currently-open Terminal (at most one per device)."""
+        return [d.terminal for d in self.devices.values() if d.terminal is not None]
+
     def _lift_pair(self):
         """Bring the windows to the top of the stack while preserving their
-        relative order (chrome below, rows above, terminal on top)."""
+        relative order (chrome below, rows above, terminals on top)."""
         try:
             self.lift()
             self._rows_win.lift()
-            if self._terminal is not None:
-                self._terminal.lift()
+            for t in self._terminals():
+                t.lift()
         except tk.TclError:
             pass
 
     def _lower_pair(self):
         try:
-            if self._terminal is not None:
-                self._terminal.lower()
+            for t in self._terminals():
+                t.lower()
             self._rows_win.lower()
             self.lower()
         except tk.TclError:
@@ -511,14 +525,14 @@ class ComMonitor(tk.Tk):
         return f"{h}h{m:02d}m"
 
     def _on_status_click(self, device: Device):
-        """Click on a row's status cell. Single-terminal policy: any open
-        terminal is closed before opening a different port."""
-        if self._terminal is not None and self._terminal.dev is device:
-            self._terminal.lift()
-            self._terminal.focus_set()
+        """Click on a row's status cell. Each device has its own terminal:
+        surface it if open, otherwise open now (if free) or queue the wait."""
+        if device.terminal is not None:
+            device.terminal.lift()
+            device.terminal.focus_set()
             return
-        if self._wanted_dev == device.id:
-            self._wanted_dev = None                     # cancel wait
+        if device.wanted:
+            device.wanted = False                       # cancel wait
             return
         # free and present right now → open immediately
         if device.present and not is_open(device.id):
@@ -526,24 +540,17 @@ class ComMonitor(tk.Tk):
             return
         # OPEN (held elsewhere) or gone → queue and grab it as soon as it's
         # present and free again
-        self._wanted_dev = device.id
+        device.wanted = True
 
     def _open_terminal(self, device: Device):
-        if self._terminal is not None:
-            self._terminal._close_quiet()               # swap: close current first
-            self._terminal = None
-        self._wanted_dev = None
+        device.wanted = False
         try:
-            self._terminal = Terminal(self, device)
-            self._terminal.lift()
+            device.terminal = Terminal(self, device)
+            device.terminal.lift()
         except Exception as e:                          # noqa: BLE001
             print(f"Failed to open terminal for {device.id}: {e}")
-            self._terminal = None
+            device.terminal = None
 
-    def _terminal_closed(self, term):
-        """Called by Terminal._on_close after it cleans up."""
-        if self._terminal is term:
-            self._terminal = None
 
     # ── inline edit of custom serial name ─────────────────────────────────────
     def _begin_serial_edit(self, lbl, device: Device, desc_lbl=None):
@@ -644,9 +651,8 @@ class ComMonitor(tk.Tk):
 
     def destroy(self):
         self._save_window_position()
-        if self._terminal is not None:
-            self._terminal._close_quiet()
-            self._terminal = None
+        for t in self._terminals():
+            t._close_quiet()
         super().destroy()
 
     def _apply_settings(self):
@@ -686,19 +692,17 @@ class ComMonitor(tk.Tk):
                     d.disappeared_at = None
                     d.flash_start = now - FLASH_ATTACK_S
 
-        # mark newly-vanished ports (skip if user has disabled the feature)
-        if self.settings["show_removed_s"] > 0:
-            for d in self.devices.values():
-                if d.id not in current and d.present:
-                    d.disappeared_at = now
-                    d.flash_start = None
+        # mark newly-vanished ports (always tracked; show_removed only affects display)
+        for d in self.devices.values():
+            if d.id not in current and d.present:
+                d.disappeared_at = now
+                d.flash_start = None
 
-        # expire/purge: drop records that are gone too long, or absent entirely.
-        # Keep the bound terminal's device alive even once its row expires.
+        # expire/purge: drop records gone too long. Keep any device that still
+        # has a terminal or a pending open, even once its row expires.
         show_removed = self.settings["show_removed_s"]
-        term_dev = self._terminal.dev if self._terminal is not None else None
         for dev_id, d in list(self.devices.items()):
-            if d.id in current or d is term_dev:
+            if d.present or d.terminal is not None or d.wanted:
                 continue
             expired = (d.disappeared_at is None
                        or show_removed == 0
@@ -706,18 +710,17 @@ class ComMonitor(tk.Tk):
             if expired:
                 del self.devices[dev_id]
 
-        # a port we're waiting for: grab it as soon as it's present AND free.
-        # We keep waiting through 'gone'/'OPEN' until then (click again to cancel).
-        if self._wanted_dev is not None and self._wanted_dev in self.devices:
-            d = self.devices[self._wanted_dev]
-            if d.present and not is_open(d.id):
+        # ports queued to open: grab each as soon as it's present AND free
+        for d in self.devices.values():
+            if d.wanted and d.present and not is_open(d.id):
                 self._open_terminal(d)
 
-        # reconcile the open terminal's connection with device presence
-        t = self._terminal
-        if t is not None:
-            tdev = t.dev.id
-            if t.state == "connected" and tdev not in current:
+        # reconcile each open terminal's connection with its device's presence
+        for d in self.devices.values():
+            t = d.terminal
+            if t is None:
+                continue
+            if t.state == "connected" and not d.present:
                 # device unplugged
                 t._close_serial()
                 if t.reconnect_on_unplug():
@@ -725,9 +728,7 @@ class ComMonitor(tk.Tk):
                     t._info("[device removed — waiting for it to return]")
                 else:
                     t._close_quiet()
-                    self._terminal = None
-            elif (t.state == "waiting"
-                  and tdev in current and not is_open(tdev)):
+            elif t.state == "waiting" and d.present and not is_open(d.id):
                 # device available again → reconnect (manual disconnect won't reach here)
                 t.reconnect()
 
@@ -828,7 +829,7 @@ class ComMonitor(tk.Tk):
                     row_font   = FONT
                     dot_c      = C_GONE
                     age_c      = C_DIM
-                    if self._wanted_dev == d.id or d.conn_state == "waiting":
+                    if d.wanted or d.conn_state == "waiting":
                         stat_t, stat_c = "waiting", C_WAIT
                     else:
                         stat_t, stat_c = "gone", C_GONE
@@ -844,7 +845,7 @@ class ComMonitor(tk.Tk):
                     occupied = (cs == "connected"
                                 or (cs == "disconnected" and is_open(d.id)))
                     waiting  = (cs == "waiting"
-                                or (cs == "disconnected" and self._wanted_dev == d.id))
+                                or (cs == "disconnected" and d.wanted))
 
                     flash_t = now - d.flash_start if d.flash_start is not None else None
                     if flash_t is not None:
@@ -1130,7 +1131,8 @@ class Terminal(tk.Toplevel):
         self.overrideredirect(True)
         self._topmost = bool(parent.settings.get("terminal_always_on_top", True))
         self.attributes("-topmost", self._topmost)
-        self.geometry(parent.settings.get("terminal_size", "640x400"))
+        saved_geo = device.geometry
+        self.geometry(saved_geo or parent.settings.get("terminal_size", "640x400"))
 
         # resize state
         self._resize_edge = None
@@ -1139,7 +1141,8 @@ class Terminal(tk.Toplevel):
 
         self._build_ui()
         self.update_idletasks()
-        self._position_above_main()
+        if not saved_geo:                                # first open → place above main
+            self._position_above_main()
         self._set_state("connected" if self._open_serial() else "waiting")
         self._schedule_poll()
 
@@ -1430,18 +1433,20 @@ class Terminal(tk.Toplevel):
             return
         try:
             w, h = self.winfo_width(), self.winfo_height()
+            x, y = self.winfo_rootx(), self.winfo_rooty()
         except tk.TclError:
             return
         if w > 1 and h > 1:
-            self.parent.settings["terminal_size"] = f"{w}x{h}"
+            self.dev.save_geometry(f"{w}x{h}+{x}+{y}")
 
     def _close_quiet(self):
-        """Tear down without notifying parent — used by swap / shutdown paths."""
+        """Tear down without notifying parent — used by unplug / shutdown paths."""
         if self._closing:
             return
         self._closing = True
         self.dev.conn_state = "disconnected"            # release the device's state
-        save_settings(self.parent.settings)             # persist size
+        self.dev.terminal = None                        # unbind from the device
+        save_settings(self.parent.settings)             # persist geometry
         if self._poll_id is not None:
             try:
                 self.after_cancel(self._poll_id)
@@ -1455,10 +1460,8 @@ class Terminal(tk.Toplevel):
             pass
 
     def _on_close(self):
-        """User clicked the X — clean up and tell the parent we're gone."""
-        parent = self.parent
+        """User clicked the X — clean up and unbind from the device."""
         self._close_quiet()
-        parent._terminal_closed(self)
 
 
 # ── port settings dialog (per VID:PID:Serial) ─────────────────────────────────
