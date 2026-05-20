@@ -90,6 +90,7 @@ DEFAULT_SETTINGS = {
     "window_y":                 None,
     "custom_names":             {},           # {"VID:PID:SERIAL": user-given name}
     "terminal_size":            "640x400",    # remembered terminal WxH
+    "terminal_always_on_top":   True,         # terminal pin — independent of main window
     "port_settings":            {},           # {"VID:PID:SERIAL": port-specific serial config}
 }
 
@@ -101,7 +102,10 @@ DEFAULT_PORT_SETTINGS = {
     "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
 }
 
-TERM_POLL_MS = 50                             # serial-read poll cadence
+TERM_POLL_MS  = 50                            # serial-read poll cadence
+TERM_BORDER   = 4                             # px resize-zone around the terminal
+TERM_MIN_W    = 280                           # minimum terminal width
+TERM_MIN_H    = 160                           # minimum terminal height
 
 
 def load_settings() -> dict:
@@ -389,22 +393,28 @@ class ComMonitor(tk.Tk):
 
     # ── paired Z-order helpers ───────────────────────────────────────────────
     def _lift_pair(self):
-        """Bring both windows to the top of the stack while preserving their
-        relative order (chrome below, rows on top)."""
+        """Bring the windows to the top of the stack while preserving their
+        relative order (chrome below, rows above, terminal on top)."""
         try:
             self.lift()
             self._rows_win.lift()
+            if self._terminal is not None:
+                self._terminal.lift()
         except tk.TclError:
             pass
 
     def _lower_pair(self):
         try:
+            if self._terminal is not None:
+                self._terminal.lower()
             self._rows_win.lower()
             self.lower()
         except tk.TclError:
             pass
 
     def _set_topmost_pair(self, on: bool):
+        # Note: the terminal keeps its own topmost state (toggled from its
+        # title bar) and is intentionally not pinned/unpinned here.
         try:
             self.attributes("-topmost", on)
             self._rows_win.attributes("-topmost", on)
@@ -460,6 +470,7 @@ class ComMonitor(tk.Tk):
         self._wanted_dev = None
         try:
             self._terminal = Terminal(self, dev, key)
+            self._terminal.lift()
         except Exception as e:                          # noqa: BLE001
             print(f"Failed to open terminal for {dev}: {e}")
             self._terminal = None
@@ -1037,8 +1048,16 @@ class Terminal(tk.Toplevel):
         self._closing = False
 
         self.title(f"Terminal — {device}")
-        self.configure(bg=C_BG)
+        self.configure(bg=C_HDR)                        # exposed margin = subtle border
+        self.overrideredirect(True)
+        self._topmost = bool(parent.settings.get("terminal_always_on_top", True))
+        self.attributes("-topmost", self._topmost)
         self.geometry(parent.settings.get("terminal_size", "640x400"))
+
+        # resize state
+        self._resize_edge = None
+        self._rs = (0, 0, 0, 0, 0, 0)                    # sx, sy, x, y, w, h
+        self._drag_ox = self._drag_oy = 0
 
         self._build_ui()
         self.update_idletasks()
@@ -1046,19 +1065,55 @@ class Terminal(tk.Toplevel):
         self._open_serial()
         self._schedule_poll()
 
-        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind("<Configure>", self._on_configure)
+        self.focus_force()                              # override-redirect needs a nudge
         self.inp.focus_set()
 
     def _build_ui(self):
-        top = tk.Frame(self, bg=C_HDR)
+        B = TERM_BORDER
+        # inner panel inset by the border on every side; the exposed C_HEAD
+        # margin around it doubles as the resize zone.
+        inner = tk.Frame(self, bg=C_BG)
+        inner.place(x=B, y=B, relwidth=1.0, width=-2 * B,
+                    relheight=1.0, height=-2 * B)
+
+        # ── resize grips (placed directly on the toplevel, around `inner`) ──
+        grips = (
+            ("n",  dict(x=B, y=0,  relwidth=1.0, width=-2 * B, height=B),  "sb_v_double_arrow"),
+            ("s",  dict(x=B, rely=1.0, y=-B, relwidth=1.0, width=-2 * B, height=B), "sb_v_double_arrow"),
+            ("w",  dict(x=0, y=B, relheight=1.0, height=-2 * B, width=B),  "sb_h_double_arrow"),
+            ("e",  dict(relx=1.0, x=-B, y=B, relheight=1.0, height=-2 * B, width=B), "sb_h_double_arrow"),
+            ("nw", dict(x=0, y=0, width=B, height=B), "size_nw_se"),
+            ("se", dict(relx=1.0, x=-B, rely=1.0, y=-B, width=B, height=B), "size_nw_se"),
+            ("ne", dict(relx=1.0, x=-B, y=0, width=B, height=B), "size_ne_sw"),
+            ("sw", dict(x=0, rely=1.0, y=-B, width=B, height=B), "size_ne_sw"),
+        )
+        for edge, place_kw, cursor in grips:
+            g = tk.Frame(self, bg=C_HDR, cursor=cursor)
+            g.place(**place_kw)
+            g.bind("<ButtonPress-1>", lambda e, ed=edge: self._resize_start(e, ed))
+            g.bind("<B1-Motion>",     self._resize_move)
+
+        # ── title bar (drag to move) ──
+        top = tk.Frame(inner, bg=C_HDR, cursor="fleur")
         top.pack(fill=tk.X)
-        tk.Label(top, text=self.device, bg=C_HDR, fg=C_PORT,
-                 font=FONT_BOLD, padx=8, pady=4).pack(side=tk.LEFT)
+        top.bind("<ButtonPress-1>", self._drag_start)
+        top.bind("<B1-Motion>",     self._drag_move)
+        self._title = tk.Label(top, text=self._title_text(), bg=C_HDR,
+                               fg=C_PORT, font=FONT_BOLD, padx=8, pady=4)
+        self._title.pack(side=tk.LEFT)
+        self._title.bind("<ButtonPress-1>", self._drag_start)
+        self._title.bind("<B1-Motion>",     self._drag_move)
         tk.Button(top, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
                   relief="flat", font=("Segoe UI", 8),
                   activebackground="#c0392b", activeforeground="white",
                   command=self._on_close).pack(side=tk.RIGHT)
+        self._aot_btn = tk.Button(top, text=" 📌 ", bg=C_HDR, bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground=C_NEW,
+                  command=self._toggle_topmost)
+        self._aot_btn.pack(side=tk.RIGHT)
+        self._update_aot_btn()
         tk.Button(top, text=" ⚙ ", bg=C_HDR, fg="#666666", bd=0,
                   relief="flat", font=("Segoe UI", 8),
                   activebackground=C_HDR, activeforeground="#aaaaaa",
@@ -1068,7 +1123,7 @@ class Terminal(tk.Toplevel):
                   activebackground=C_HDR, activeforeground="#aaaaaa",
                   command=self._clear).pack(side=tk.RIGHT)
 
-        out_frm = tk.Frame(self, bg=C_BG)
+        out_frm = tk.Frame(inner, bg=C_BG)
         out_frm.pack(fill=tk.BOTH, expand=True)
         self.out = tk.Text(out_frm, bg=C_BG, fg=C_DESC, font=FONT,
                            bd=0, wrap=tk.NONE, padx=6, pady=4,
@@ -1082,10 +1137,72 @@ class Terminal(tk.Toplevel):
         self.out.tag_configure("rx",   foreground=C_DESC)
         self.out.tag_configure("info", foreground=C_NEW)
 
-        self.inp = tk.Entry(self, bg=C_HDR, fg=C_PORT, font=FONT, bd=0,
+        self.inp = tk.Entry(inner, bg=C_HDR, fg=C_PORT, font=FONT, bd=0,
                             relief="flat", insertbackground=C_PORT)
         self.inp.pack(fill=tk.X, padx=6, pady=(0, 6))
         self.inp.bind("<Return>", self._on_send)
+        self.bind("<Escape>", lambda _: self._on_close())
+
+    # ── title bar text ──────────────────────────────────────────────────────
+    def _title_text(self) -> str:
+        """e.g. 'COM7 - MyBoard - 115200 8N1', or without the name if unset."""
+        s = self.parent._port_settings_for(self.key)
+        params = f"{s['baud']} {s['data_bits']}{s['parity']}{s['stop_bits']}"
+        name = self.parent.settings["custom_names"].get(self.key, "").strip()
+        parts = [self.device] + ([name] if name else []) + [params]
+        return " - ".join(parts)
+
+    def _refresh_title(self):
+        if getattr(self, "_title", None) is not None:
+            self._title.configure(text=self._title_text())
+
+    # ── always-on-top (own toggle, independent of the main window) ──────────
+    def _toggle_topmost(self):
+        self._topmost = not self._topmost
+        try:
+            self.attributes("-topmost", self._topmost)
+        except tk.TclError:
+            pass
+        self.parent.settings["terminal_always_on_top"] = self._topmost
+        save_settings(self.parent.settings)
+        self._update_aot_btn()
+
+    def _update_aot_btn(self):
+        # lit when pinned, dimmed when not — a simple on/off switch
+        self._aot_btn.configure(fg=C_NEW if self._topmost else "#666666")
+
+    # ── move / resize ──────────────────────────────────────────────────────
+    def _drag_start(self, e):
+        self._drag_ox = e.x_root - self.winfo_rootx()
+        self._drag_oy = e.y_root - self.winfo_rooty()
+
+    def _drag_move(self, e):
+        self.geometry(f"+{e.x_root - self._drag_ox}+{e.y_root - self._drag_oy}")
+
+    def _resize_start(self, e, edge):
+        self._resize_edge = edge
+        self._rs = (e.x_root, e.y_root,
+                    self.winfo_rootx(), self.winfo_rooty(),
+                    self.winfo_width(), self.winfo_height())
+
+    def _resize_move(self, e):
+        if self._resize_edge is None:
+            return
+        sx, sy, x0, y0, w0, h0 = self._rs
+        dx, dy = e.x_root - sx, e.y_root - sy
+        x, y, w, h = x0, y0, w0, h0
+        edge = self._resize_edge
+        if "e" in edge:
+            w = max(TERM_MIN_W, w0 + dx)
+        if "s" in edge:
+            h = max(TERM_MIN_H, h0 + dy)
+        if "w" in edge:
+            w = max(TERM_MIN_W, w0 - dx)
+            x = x0 + (w0 - w)
+        if "n" in edge:
+            h = max(TERM_MIN_H, h0 - dy)
+            y = y0 + (h0 - h)
+        self.geometry(f"{w}x{h}+{x}+{y}")
 
     def _open_serial(self):
         s = self.parent._port_settings_for(self.key)
@@ -1166,6 +1283,7 @@ class Terminal(tk.Toplevel):
         """Reopen the serial port with whatever port_settings are now in effect."""
         self._close_serial()
         self._open_serial()
+        self._refresh_title()
 
     def _position_above_main(self):
         try:
@@ -1212,7 +1330,7 @@ class Terminal(tk.Toplevel):
 
 # ── port settings dialog (per VID:PID:Serial) ─────────────────────────────────
 class PortSettingsDialog(tk.Toplevel):
-    BAUDS = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600)
+    BAUDS = (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 2000000)
     LE_TO_LABEL = {"\r\n": "CRLF", "\n": "LF", "\r": "CR", "": "none"}
     LABEL_TO_LE = {v: k for k, v in LE_TO_LABEL.items()}
 
@@ -1244,33 +1362,36 @@ class PortSettingsDialog(tk.Toplevel):
             tk.Label(frm, text=text, bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
                      ).grid(row=r, column=0, sticky="w", **pad)
 
-        def spin(r, var, values):
+        def spin(r, var, values, value):
             tk.Spinbox(frm, values=values, textvariable=var, width=10,
                        bg=C_HDR, fg=C_PORT, font=FONT,
                        buttonbackground=C_HDR, relief="flat",
                        insertbackground=C_PORT
                        ).grid(row=r, column=1, sticky="w", **pad)
+            # `values=` overwrites the textvariable to its first entry on
+            # creation; restore the real current value afterwards.
+            var.set(value)
 
         label(0, "Baud:")
-        self.var_baud = tk.IntVar(value=s["baud"])
-        spin(0, self.var_baud, self.BAUDS)
+        self.var_baud = tk.IntVar()
+        spin(0, self.var_baud, self.BAUDS, s["baud"])
 
         label(1, "Data bits:")
-        self.var_data = tk.IntVar(value=s["data_bits"])
-        spin(1, self.var_data, (5, 6, 7, 8))
+        self.var_data = tk.IntVar()
+        spin(1, self.var_data, (5, 6, 7, 8), s["data_bits"])
 
         label(2, "Parity:")
-        self.var_par = tk.StringVar(value=s["parity"])
-        spin(2, self.var_par, ("N", "E", "O", "M", "S"))
+        self.var_par = tk.StringVar()
+        spin(2, self.var_par, ("N", "E", "O", "M", "S"), s["parity"])
 
         label(3, "Stop bits:")
-        self.var_stop = tk.DoubleVar(value=s["stop_bits"])
-        spin(3, self.var_stop, (1, 1.5, 2))
+        self.var_stop = tk.DoubleVar()
+        spin(3, self.var_stop, (1, 1.5, 2), s["stop_bits"])
 
         label(4, "Line ending:")
-        self.var_le = tk.StringVar(
-            value=self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
-        spin(4, self.var_le, tuple(self.LE_TO_LABEL.values()))
+        self.var_le = tk.StringVar()
+        spin(4, self.var_le, tuple(self.LE_TO_LABEL.values()),
+             self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
 
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
