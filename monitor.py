@@ -483,6 +483,13 @@ class ComMonitor(tk.Tk):
         if self._terminal is term:
             self._terminal = None
 
+    def _terminal_state_for(self, dev):
+        """The open terminal's connection state for `dev`, else None.
+        Single-terminal policy means at most one device is ever bound."""
+        if self._terminal is not None and self._terminal.device == dev:
+            return self._terminal.state
+        return None
+
     # ── inline edit of custom serial name ─────────────────────────────────────
     def _begin_serial_edit(self, lbl, key, desc_lbl=None):
         """Overlay an Entry on the serial cell so the user can type a custom
@@ -656,22 +663,23 @@ class ComMonitor(tk.Tk):
                                    info.get("serial_number"))
                 self._open_terminal(dev_w, key)
 
-        # open terminal whose device just unplugged / came back
-        if self._terminal is not None:
-            tdev = self._terminal.device
-            was_present = tdev in self._known_ports
-            if was_present and tdev not in current:
-                # unplugged: close, or keep open to reconnect per device setting
-                if self._terminal.reconnect_on_unplug():
-                    self._terminal._info("[device removed — waiting for it to return]")
+        # reconcile the open terminal's connection with device presence
+        t = self._terminal
+        if t is not None:
+            tdev = t.device
+            if t.state == "connected" and tdev not in current:
+                # device unplugged
+                t._close_serial()
+                if t.reconnect_on_unplug():
+                    t._set_state("waiting")
+                    t._info("[device removed — waiting for it to return]")
                 else:
-                    self._terminal._close_quiet()
+                    t._close_quiet()
                     self._terminal = None
-            elif (tdev in current and not was_present
-                  and self._terminal.serial is None
-                  and not is_open(tdev)):
-                # came back while we held the window open → reconnect
-                self._terminal.reconnect()
+            elif (t.state == "waiting"
+                  and tdev in current and not is_open(tdev)):
+                # device available again → reconnect (manual disconnect won't reach here)
+                t.reconnect()
 
         # port changes lift the window pair and pin them on top for one
         # interaction timeout so the user actually notices the connect/disconnect.
@@ -770,7 +778,8 @@ class ComMonitor(tk.Tk):
                     row_font   = FONT
                     dot_c      = C_GONE
                     age_c      = C_DIM
-                    if self._wanted_dev == dev:
+                    if (self._wanted_dev == dev
+                            or self._terminal_state_for(dev) == "waiting"):
                         stat_t, stat_c = "waiting", C_WAIT
                     else:
                         stat_t, stat_c = "gone", C_GONE
@@ -780,10 +789,13 @@ class ComMonitor(tk.Tk):
                     desc_c     = C_DIM
                 else:
                     age_s    = now - self._first_seen[dev]
-                    ours     = (self._terminal is not None
-                                and self._terminal.device == dev)
-                    occupied = ours or is_open(dev)
-                    waiting  = (not ours and self._wanted_dev == dev)
+                    tstate   = self._terminal_state_for(dev)
+                    # our terminal owns the port only while actually connected;
+                    # waiting/disconnected releases it so the row reflects that
+                    occupied = (tstate == "connected"
+                                or (tstate is None and is_open(dev)))
+                    waiting  = (tstate == "waiting"
+                                or (tstate is None and self._wanted_dev == dev))
 
                     flash_t = now - self._flash_start[dev] if dev in self._flash_start else None
                     if flash_t is not None:
@@ -1067,6 +1079,10 @@ class Terminal(tk.Toplevel):
         self.serial: "serial.Serial | None" = None
         self._poll_id = None
         self._closing = False
+        # "connected" = serial open; "waiting" = want it, reconnect when the
+        # device returns; "disconnected" = user closed it, no auto-reconnect.
+        self.state    = "disconnected"
+        self._conn_btn = None
 
         self.title(f"Terminal — {device}")
         self.configure(bg=C_HDR)                        # exposed margin = subtle border
@@ -1083,7 +1099,7 @@ class Terminal(tk.Toplevel):
         self._build_ui()
         self.update_idletasks()
         self._position_above_main()
-        self._open_serial()
+        self._set_state("connected" if self._open_serial() else "waiting")
         self._schedule_poll()
 
         self.bind("<Configure>", self._on_configure)
@@ -1143,6 +1159,12 @@ class Terminal(tk.Toplevel):
                   relief="flat", font=("Segoe UI", 8),
                   activebackground=C_HDR, activeforeground="#aaaaaa",
                   command=self._clear).pack(side=tk.RIGHT)
+        self._conn_btn = tk.Button(top, bg=C_HDR, bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="white",
+                  command=self._toggle_connection)
+        self._conn_btn.pack(side=tk.RIGHT)
+        self._update_conn_btn()
 
         out_frm = tk.Frame(inner, bg=C_BG)
         out_frm.pack(fill=tk.BOTH, expand=True)
@@ -1176,6 +1198,35 @@ class Terminal(tk.Toplevel):
     def _refresh_title(self):
         if getattr(self, "_title", None) is not None:
             self._title.configure(text=self._title_text())
+
+    # ── connect / disconnect state machine ──────────────────────────────────
+    def _set_state(self, st: str):
+        self.state = st
+        self._update_conn_btn()
+
+    def _toggle_connection(self):
+        if self.state == "disconnected":
+            # user wants a connection: take it now, else wait for the device
+            self._set_state("connected" if self._open_serial() else "waiting")
+        else:
+            # connected or waiting → user opts out; no auto-reconnect
+            self._close_serial()
+            self._set_state("disconnected")
+            self._info("[disconnected]")
+
+    def _update_conn_btn(self):
+        if getattr(self, "_conn_btn", None) is None:
+            return
+        # label = the action a click performs; colour = the current state
+        text, fg = {
+            "connected":    (" Disconnect ", C_FREE),
+            "waiting":      (" Cancel ",     C_WAIT),
+            "disconnected": (" Connect ",    C_OPEN),
+        }.get(self.state, (" Connect ", C_OPEN))
+        try:
+            self._conn_btn.configure(text=text, fg=fg)
+        except tk.TclError:                              # window tearing down
+            pass
 
     # ── always-on-top (own toggle, independent of the main window) ──────────
     def _toggle_topmost(self):
@@ -1225,7 +1276,7 @@ class Terminal(tk.Toplevel):
             y = y0 + (h0 - h)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _open_serial(self):
+    def _open_serial(self) -> bool:
         s = self.parent._port_settings_for(self.key)
         try:
             self.serial = serial.Serial(
@@ -1237,9 +1288,11 @@ class Terminal(tk.Toplevel):
                 timeout=0)
             self._info(f"[connected @ {s['baud']} "
                        f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
+            return True
         except (serial.SerialException, OSError, ValueError) as e:
             self.serial = None
             self._info(f"[open failed: {e}]")
+            return False
 
     def _close_serial(self):
         if self.serial is not None:
@@ -1284,10 +1337,14 @@ class Terminal(tk.Toplevel):
         return "break"
 
     def _append(self, text, tag):
+        # auto-scroll only when already pinned to the bottom; if the user has
+        # scrolled up, hold position so they can read/copy while data arrives
+        at_bottom = self.out.yview()[1] >= 0.999
         self.out.configure(state="normal")
         self.out.insert(tk.END, text, tag)
-        self.out.see(tk.END)
         self.out.configure(state="disabled")
+        if at_bottom:
+            self.out.see(tk.END)
 
     def _info(self, text):
         self._append(text + "\n", "info")
@@ -1303,7 +1360,7 @@ class Terminal(tk.Toplevel):
     def reconnect(self):
         """Reopen the serial port with whatever port_settings are now in effect."""
         self._close_serial()
-        self._open_serial()
+        self._set_state("connected" if self._open_serial() else "waiting")
         self._refresh_title()
 
     def reconnect_on_unplug(self) -> bool:
