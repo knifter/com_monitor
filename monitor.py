@@ -90,6 +90,7 @@ DEFAULT_SETTINGS = {
     "window_y":                 None,
     "terminal_size":            "640x400",    # default terminal WxH (per-device geometry overrides)
     "terminal_always_on_top":   True,         # terminal pin — independent of main window
+    "terminal_alpha":           ALPHA_OPAQUE, # terminal window opacity
     # per-device config keyed by "VID:PID:SERIAL"; each entry may carry a
     # "name" and/or serial settings — either alone is fine.
     "device_settings":          {},
@@ -477,6 +478,15 @@ class ComMonitor(tk.Tk):
         """Every currently-open Terminal (at most one per device)."""
         return [d.terminal for d in self.devices.values() if d.terminal is not None]
 
+    def _update_terminal_alpha(self):
+        """Apply terminal_alpha to every open terminal (live-preview + save)."""
+        a = float(self.settings.get("terminal_alpha", ALPHA_OPAQUE))
+        for t in self._terminals():
+            try:
+                t.attributes("-alpha", a)
+            except tk.TclError:
+                pass
+
     def _lift_pair(self):
         """Bring the windows to the top of the stack while preserving their
         relative order (chrome below, rows above, terminals on top)."""
@@ -662,6 +672,7 @@ class ComMonitor(tk.Tk):
         self._set_topmost_pair(self.settings["always_on_top"])
         self._top_active = self.settings["always_on_top"]
         self._update_alpha()
+        self._update_terminal_alpha()
 
     def _open_settings(self):
         SettingsDialog(self)
@@ -1045,6 +1056,19 @@ class SettingsDialog(tk.Toplevel):
                  font=FONT, activebackground=C_PORT,
                  ).grid(row=7, column=1, sticky="w", **pad)
 
+        # Terminal transparency (applies to every open terminal; live preview)
+        tk.Label(frm, text="Terminal transparency:",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=8, column=0, sticky="w", **pad)
+        self.var_tan = tk.DoubleVar(value=s.get("terminal_alpha", ALPHA_OPAQUE))
+        tk.Scale(frm, from_=0.4, to=1.0, resolution=0.01,
+                 orient=tk.HORIZONTAL, variable=self.var_tan,
+                 command=self._preview_terminal_alpha,
+                 bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
+                 highlightthickness=0, bd=0, length=160,
+                 font=FONT, activebackground=C_PORT,
+                 ).grid(row=8, column=1, sticky="w", **pad)
+
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(6, 12))
@@ -1064,11 +1088,19 @@ class SettingsDialog(tk.Toplevel):
             return
         self.parent._update_alpha()
 
+    def _preview_terminal_alpha(self, val):
+        try:
+            self.parent.settings["terminal_alpha"] = float(val)
+        except (TypeError, ValueError):
+            return
+        self.parent._update_terminal_alpha()
+
     def _cancel(self):
         if not self._saved:
             self.parent.settings.clear()
             self.parent.settings.update(self._snapshot)
             self.parent._update_alpha()
+            self.parent._update_terminal_alpha()
         self.destroy()
 
     def _save(self):
@@ -1109,6 +1141,10 @@ class SettingsDialog(tk.Toplevel):
             s["normal_alpha"] = float(self.var_an.get())
         except (tk.TclError, ValueError):
             pass
+        try:
+            s["terminal_alpha"] = float(self.var_tan.get())
+        except (tk.TclError, ValueError):
+            pass
         save_settings(s)
         self.parent._apply_settings()
         self._saved = True
@@ -1131,6 +1167,8 @@ class Terminal(tk.Toplevel):
         self.overrideredirect(True)
         self._topmost = bool(parent.settings.get("terminal_always_on_top", True))
         self.attributes("-topmost", self._topmost)
+        self.attributes("-alpha",
+                        float(parent.settings.get("terminal_alpha", ALPHA_OPAQUE)))
         saved_geo = device.geometry
         self.geometry(saved_geo or parent.settings.get("terminal_size", "640x400"))
 
