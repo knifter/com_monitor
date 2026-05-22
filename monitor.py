@@ -410,8 +410,37 @@ class ComMonitor(tk.Tk):
             self._last_chrome_alpha = chrome_alpha
 
     def _animate_fade(self):
+        # poll on the fast tick so a motionless cursor resting over the window
+        # holds it solid (the 500 ms refresh poll alone lets the alpha dim
+        # between ticks).
+        if self._pointer_holds_visible():
+            self._last_interaction = time.time()
         self._update_alpha()
         self.after(FADE_TICK_MS, self._animate_fade)
+
+    def _pointer_holds_visible(self) -> bool:
+        """True while the pointer should keep the window awake: over the rows
+        window, or over the chrome window *while it is still visible*, or a
+        widget is focused. Once the chrome has faded to alpha 0 the pointer over
+        its (invisible) strip is ignored, so it stays hidden until the pointer
+        reaches the rows."""
+        try:
+            px, py = self.winfo_pointerxy()
+            # rows window always holds it awake
+            r = self._rows_win
+            rx, ry = r.winfo_rootx(), r.winfo_rooty()
+            rw, rh = r.winfo_width(), r.winfo_height()
+            if rx <= px < rx + rw and ry <= py < ry + rh:
+                return True
+            # chrome window holds it only while still visible (alpha > 0)
+            if self._last_chrome_alpha > 0.0:
+                cx, cy = self.winfo_rootx(), self.winfo_rooty()
+                cw, ch = self.winfo_width(), self.winfo_height()
+                if cx <= px < cx + cw and cy <= py < cy + ch:
+                    return True
+            return self._rows_win.focus_displayof() is not None
+        except tk.TclError:
+            return False
 
     # ── two-window sync ───────────────────────────────────────────────────────
     def _sync_rows_geometry(self, _event=None):
@@ -751,23 +780,11 @@ class ComMonitor(tk.Tk):
             self._lift_pair()
         self._known_ports = current
 
-        # interaction poll: pointer over EITHER window (or focus on either)
-        # holds the timer at zero. Once both are gone, the timer starts counting.
-        try:
-            px, py = self.winfo_pointerxy()
-            in_any = False
-            for w in (self, self._rows_win):
-                wx, wy = w.winfo_rootx(), w.winfo_rooty()
-                ww, wh = w.winfo_width(), w.winfo_height()
-                if wx <= px < wx + ww and wy <= py < wy + wh:
-                    in_any = True
-                    break
-            focused = (self.focus_displayof() is not None
-                       or self._rows_win.focus_displayof() is not None)
-            if in_any or focused:
-                self._last_interaction = now
-        except tk.TclError:
-            pass
+        # interaction poll: pointer resting over the window (or a focused
+        # widget) holds the timer at zero. The chrome strip counts only while
+        # still visible, so hovering it once invisible does not bring it back.
+        if self._pointer_holds_visible():
+            self._last_interaction = now
 
         idle = now - self._last_interaction
 
@@ -1032,12 +1049,12 @@ class SettingsDialog(tk.Toplevel):
                    insertbackground=C_PORT
                    ).grid(row=5, column=1, sticky="w", **pad)
 
-        # Interaction timeout (seconds before fade begins)
-        tk.Label(frm, text="Fade after no interaction (s):",
+        # Interaction timeout (seconds before fade begins; 0 = fade at once)
+        tk.Label(frm, text="Fade after no interaction (s, 0 = immediate):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
                  ).grid(row=6, column=0, sticky="w", **pad)
         self.var_it = tk.IntVar(value=s["interaction_timeout_s"])
-        tk.Spinbox(frm, from_=1, to=3600, increment=1, textvariable=self.var_it,
+        tk.Spinbox(frm, from_=0, to=3600, increment=1, textvariable=self.var_it,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
@@ -1133,7 +1150,7 @@ class SettingsDialog(tk.Toplevel):
             pass
         try:
             v = int(self.var_it.get())
-            if v > 0:
+            if v >= 0:
                 s["interaction_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
