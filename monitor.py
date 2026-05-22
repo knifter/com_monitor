@@ -13,6 +13,7 @@ import math
 import time
 import json
 import os
+import sys
 
 try:
     import serial.tools.list_ports
@@ -74,8 +75,14 @@ COLS = [
 ]
 
 # ── settings ──────────────────────────────────────────────────────────────────
-SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "settings.json")
+# Anchor settings.json next to the program. In a PyInstaller --onefile build
+# __file__ points at the temp _MEIxxxx extraction dir (wiped on exit), so use the
+# directory of the actual .exe instead; otherwise use the script's own folder.
+if getattr(sys, "frozen", False):
+    _APP_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+SETTINGS_FILE = os.path.join(_APP_DIR, "com_monitor.json")
 
 DEFAULT_SETTINGS = {
     "highlight_duration_s":     20.0,         # row-flash fade duration
