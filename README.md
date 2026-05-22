@@ -1,70 +1,40 @@
 # USB COM Monitor
 
-Small always-on-top desktop widget that shows all connected COM ports at a glance — VID/PID, connection age, open/free status, and a flash animation when a new port appears.
+Small always-on-top desktop widget that lists every connected COM port at a glance — port name, VID/PID, how long it has been plugged in, whether it is open or free, plus a flash animation as ports come and go. Double-clicking a port opens a built-in serial terminal for it.
 
-Useful during embedded development when you need to watch ports enumerate and de-enumerate without keeping Device Manager open.
+Useful during embedded development when you want to watch ports enumerate and talk to them without keeping Device Manager and a separate terminal program open.
 
-![dark floating widget with COM port rows]
+![The COM port list widget](PortList.png)
 
-## Requirements
+## Features
 
-```
-pip install pyserial pywin32
-```
+- **Live port list** — port name, VID:PID, age, a colour status dot (green = free, red = open by another process, yellow = just appeared), open/free status, serial number / hub location, and the Windows description.
+- **Flash on connect** — a newly appeared port flashes amber and fades back over the highlight duration; ports present at startup don't flash.
+- **Removed ports linger** — unplugged ports stay listed in red and fade out for a configurable time so you can see what just disappeared.
+- **Custom names** — give any device a memorable label, keyed by VID:PID:serial so it sticks across re-plugs.
+- **Stays out of the way** — always-on-top (optionally dropped after idle), optional move-to-back on idle, and an opacity fade when you're not interacting with it. Transparency is adjustable.
+- **Per-device memory** — names, serial settings, and terminal window size/position are saved per device in `settings.json`.
 
-`pywin32` is Windows-only and used for reliable "is this port open" detection via `CreateFile` without actually opening the port. Falls back to a pyserial probe if unavailable.
+### Using it
 
-## Run
+- **Open a terminal** — click a row's **Status** cell. If the port is busy or the device is unplugged, the row shows *waiting* and the terminal opens automatically as soon as the port is free again.
+- **Edit a custom name** — double-click the **Serial / Loc** cell, type a name, and press **Enter** (**Esc** cancels). Clear the text to remove the name.
+- **Edit settings** — click the **⚙** button in the title bar. The dialog covers highlight duration, how long removed ports stay, always-on-top and its idle drop, move-to-back on idle, the fade-after-idle delay (0 = fade immediately on leaving), and live-preview sliders for window and terminal transparency.
 
-```
-python tools/com_monitor/monitor.py
-```
+## Terminal
 
-The window has no taskbar entry. Drag it by the title bar; close with **✕**, **Esc**, or **Ctrl+Q**.
+A serial terminal opens in its own borderless window per device. Each remembers its own size and position.
 
-## Columns
+![The serial terminal window](Terminal.png)
 
-| Column | What it shows |
-|---|---|
-| **Port** | COM port name (e.g. `COM19`) |
-| **VID:PID** | USB Vendor and Product ID in hex, sourced from Windows SetupAPI — same data as Device Manager, no port opening needed |
-| **Age** | Time since the port first appeared (`5s`, `1m23s`, `2h04m`) |
-| **●** | Colour dot: green = free, red = open by another process, yellow = appeared < 8 s ago |
-| **Status** | `OPEN` / `free` — whether another process holds the port |
-| **Serial / Loc** | USB serial number and hub location string from SetupAPI |
-| **Description** | Human-readable device name from Windows |
+- **Send / receive** — RX and TX are colour-coded in the output pane; type in the input line and press **Enter** to send, with a configurable line ending.
+- **Smart auto-scroll** — follows new data only when you're already at the bottom, so scrolling up to read holds your position.
+- **Connect / Disconnect** — toggle the connection from the title bar; the row's status reflects the live connection state.
+- **Reconnect on unplug** — optionally keeps the terminal open when the device is removed and reconnects automatically when it returns.
+- **Pin (📌)** — toggle the terminal's always-on-top independently of the main window.
+- **Clear** the output, or open the **⚙** port settings.
+- **Resizable** from any edge or corner; drag the title bar to move.
 
-## Flash on connect
+### Port settings
 
-When a port appears **after the monitor starts**, the row flashes amber and fades back to the normal background over roughly a minute.
-
-The envelope shape is:
-
-```
-brightness(t) = exp(−K × √t)    where t = seconds since connect
-```
-
-This gives a fast initial drop (most of the brightness is gone in the first 15 s) followed by a very slow tail — like a struck note decaying. Ports present at startup do not flash.
-
-Text is **bold** while the row is still above ~10 % brightness (first ~30 s with default settings).
-
-## Controls
-
-| Action | Effect |
-|---|---|
-| Drag title bar | Move window |
-| **◑** button | Toggle between opaque and dimmed (35 % alpha) |
-| **✕** / Esc / Ctrl+Q | Close |
-
-## Tunables (top of `monitor.py`)
-
-| Constant | Default | Effect |
-|---|---|---|
-| `REFRESH_MS` | `500` | Poll interval in milliseconds |
-| `NEW_DOT_S` | `8` | Seconds the dot/age text stays yellow after connect |
-| `C_ROW_FLASH` | `#8a6218` | Peak amber colour of the flash row |
-| `FLASH_ATTACK_S` | `0.3` | Attack ramp duration (visual only at sub-second refresh) |
-| `FLASH_DECAY_K` | `0.50` | Decay speed — higher = faster early drop, same ~0 at 60 s |
-| `BOLD_THRESHOLD` | `0.1` | Brightness level below which text reverts to normal weight |
-| `ALPHA_OPAQUE` | `0.96` | Window opacity in normal mode |
-| `ALPHA_DIM` | `0.35` | Window opacity when dimmed with ◑ |
+Open the terminal's **⚙** to set **baud, data bits, parity, stop bits, line ending,** and **reconnect-on-unplug**. Settings are saved per device (VID:PID:serial) and applied immediately on save.
