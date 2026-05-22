@@ -2,3 +2,6 @@ settings.json
 uv.lock
 .venv
 __pycache__
+com_monitor.spec
+build
+dist
