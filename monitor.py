@@ -105,6 +105,7 @@ DEFAULT_PORT_SETTINGS = {
     "stop_bits":   1,                         # 1, 1.5, 2
     "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
     "reconnect_on_unplug": True,              # keep terminal open & reconnect when device returns
+    "signals":     "controls",                # title-bar modem lines: "none" | "controls" | "full"
 }
 
 TERM_POLL_MS  = 50                            # serial-read poll cadence
@@ -1178,6 +1179,12 @@ class Terminal(tk.Toplevel):
         self._poll_id = None
         self._closing = False
         self._conn_btn = None
+        # modem-control state: RTS/DTR are outputs we drive (default asserted),
+        # CTS/DSR/DCD are inputs we read. Widget refs are filled by _build_signals.
+        self._rts = self._dtr = True
+        self._sig_frame = None
+        self._rts_btn = self._dtr_btn = None
+        self._cts_lbl = self._dsr_lbl = self._dcd_lbl = None
 
         self.title(f"Terminal — {device.id}")
         self.configure(bg=C_HDR)                        # exposed margin = subtle border
@@ -1240,6 +1247,10 @@ class Terminal(tk.Toplevel):
         self._title.pack(side=tk.LEFT)
         self._title.bind("<ButtonPress-1>", self._drag_start)
         self._title.bind("<B1-Motion>",     self._drag_move)
+        # modem-line controls/indicators — sit right after the baud/8N1 text
+        self._sig_frame = tk.Frame(top, bg=C_HDR)
+        self._sig_frame.pack(side=tk.LEFT, padx=(6, 0))
+        self._build_signals()
         tk.Button(top, text=" ✕ ", bg=C_HDR, fg="#666666", bd=0,
                   relief="flat", font=("Segoe UI", 8),
                   activebackground="#c0392b", activeforeground="white",
@@ -1297,6 +1308,92 @@ class Terminal(tk.Toplevel):
     def _refresh_title(self):
         if getattr(self, "_title", None) is not None:
             self._title.configure(text=self._title_text())
+
+    # ── modem-control lines (title-bar buttons/indicators) ───────────────────
+    def _signals_mode(self) -> str:
+        m = self.dev.port_settings().get("signals", "none")
+        return m if m in ("none", "controls", "full") else "none"
+
+    def _build_signals(self):
+        """(Re)create the RTS/DTR controls and CTS/DSR/DCD indicators to match
+        the device's configured signals mode. Called on build and after the
+        port-settings dialog may have changed the mode."""
+        if self._sig_frame is None:
+            return
+        for w in self._sig_frame.winfo_children():
+            w.destroy()
+        self._rts_btn = self._dtr_btn = None
+        self._cts_lbl = self._dsr_lbl = self._dcd_lbl = None
+
+        mode = self._signals_mode()
+        if mode == "none":
+            return
+
+        # RTS / DTR — clickable outputs we drive
+        self._rts_btn = tk.Button(self._sig_frame, text=" RTS ", bg=C_HDR, bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="white",
+                  command=lambda: self._toggle_output("rts"))
+        self._rts_btn.pack(side=tk.LEFT)
+        self._dtr_btn = tk.Button(self._sig_frame, text=" DTR ", bg=C_HDR, bd=0,
+                  relief="flat", font=("Segoe UI", 8),
+                  activebackground=C_HDR, activeforeground="white",
+                  command=lambda: self._toggle_output("dtr"))
+        self._dtr_btn.pack(side=tk.LEFT)
+
+        if mode == "full":
+            # CTS / DSR / DCD — read-only inputs (updated each poll)
+            self._cts_lbl = tk.Label(self._sig_frame, text=" CTS ", bg=C_HDR,
+                                     fg=C_DIM, font=("Segoe UI", 8))
+            self._cts_lbl.pack(side=tk.LEFT)
+            self._dsr_lbl = tk.Label(self._sig_frame, text=" DSR ", bg=C_HDR,
+                                     fg=C_DIM, font=("Segoe UI", 8))
+            self._dsr_lbl.pack(side=tk.LEFT)
+            self._dcd_lbl = tk.Label(self._sig_frame, text=" DCD ", bg=C_HDR,
+                                     fg=C_DIM, font=("Segoe UI", 8))
+            self._dcd_lbl.pack(side=tk.LEFT)
+
+        self._update_signal_widgets()
+
+    def _toggle_output(self, line: str):
+        """Flip RTS or DTR; drive the live port if open and remember the state
+        so it's re-applied on the next (re)connect."""
+        if line == "rts":
+            self._rts = not self._rts
+        else:
+            self._dtr = not self._dtr
+        if self.serial is not None:
+            try:
+                if line == "rts":
+                    self.serial.rts = self._rts
+                else:
+                    self.serial.dtr = self._dtr
+            except (serial.SerialException, OSError):
+                pass
+        self._update_signal_widgets()
+
+    def _update_signal_widgets(self):
+        """Repaint RTS/DTR from our tracked output state and CTS/DSR/DCD from the
+        live port. Green = asserted/high, dim = low/deasserted."""
+        def paint(w, on):
+            if w is not None:
+                try:
+                    w.configure(fg=C_FREE if on else C_DIM)
+                except tk.TclError:
+                    pass
+        paint(self._rts_btn, self._rts)
+        paint(self._dtr_btn, self._dtr)
+        if self._cts_lbl is None:                       # not in "full" mode
+            return
+        cts = dsr = dcd = False
+        if self.serial is not None:
+            try:
+                cts, dsr, dcd = self.serial.cts, self.serial.dsr, self.serial.cd
+            except (serial.SerialException, OSError, AttributeError):
+                cts = dsr = dcd = False
+        paint(self._cts_lbl, cts)
+        paint(self._dsr_lbl, dsr)
+        paint(self._dcd_lbl, dcd)
 
     # ── connect / disconnect state machine ──────────────────────────────────
     # connection state lives on the Device ("connected"/"waiting"/"disconnected")
@@ -1395,8 +1492,14 @@ class Terminal(tk.Toplevel):
                 parity=s["parity"],
                 stopbits=s["stop_bits"],
                 timeout=0)
+            try:                                        # apply our RTS/DTR state
+                self.serial.rts = self._rts
+                self.serial.dtr = self._dtr
+            except (serial.SerialException, OSError):
+                pass
             self._info(f"[connected @ {s['baud']} "
                        f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
+            self._update_signal_widgets()
             return True
         except (serial.SerialException, OSError, ValueError) as e:
             self.serial = None
@@ -1427,6 +1530,8 @@ class Terminal(tk.Toplevel):
             except (serial.SerialException, OSError) as e:
                 self._info(f"[read error: {e}]")
                 self._close_serial()
+        if self._cts_lbl is not None:                   # "full" mode: poll inputs
+            self._update_signal_widgets()
         self._schedule_poll()
 
     def _on_send(self, _e=None):
@@ -1471,6 +1576,7 @@ class Terminal(tk.Toplevel):
         self._close_serial()
         self._set_state("connected" if self._open_serial() else "waiting")
         self._refresh_title()
+        self._build_signals()
 
     def reconnect_on_unplug(self) -> bool:
         return bool(self.dev.port_settings().get("reconnect_on_unplug", True))
@@ -1524,6 +1630,8 @@ class PortSettingsDialog(tk.Toplevel):
     BAUDS = (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 2000000)
     LE_TO_LABEL = {"\r\n": "CRLF", "\n": "LF", "\r": "CR", "": "none"}
     LABEL_TO_LE = {v: k for k, v in LE_TO_LABEL.items()}
+    SIG_TO_LABEL = {"none": "None", "controls": "RTS/DTR", "full": "Full"}
+    LABEL_TO_SIG = {v: k for k, v in SIG_TO_LABEL.items()}
 
     def __init__(self, terminal: "Terminal"):
         super().__init__(terminal)
@@ -1584,13 +1692,18 @@ class PortSettingsDialog(tk.Toplevel):
         spin(4, self.var_le, tuple(self.LE_TO_LABEL.values()),
              self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
 
+        label(5, "Signals:")
+        self.var_sig = tk.StringVar()
+        spin(5, self.var_sig, tuple(self.SIG_TO_LABEL.values()),
+             self.SIG_TO_LABEL.get(s.get("signals", "none"), "None"))
+
         self.var_reconn = tk.BooleanVar(value=s["reconnect_on_unplug"])
         tk.Checkbutton(frm, text="Reconnect on unplug",
                        variable=self.var_reconn,
                        bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
                        activebackground=C_BG, activeforeground=C_DESC,
                        font=FONT, anchor="w"
-                       ).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
+                       ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
@@ -1625,6 +1738,8 @@ class PortSettingsDialog(tk.Toplevel):
                                     self.var_le.get(), "\r\n")
         except (tk.TclError, ValueError): pass
         try: new["reconnect_on_unplug"] = bool(self.var_reconn.get())
+        except (tk.TclError, ValueError): pass
+        try: new["signals"] = self.LABEL_TO_SIG.get(self.var_sig.get(), "none")
         except (tk.TclError, ValueError): pass
 
         # merge serial keys into the device's entry (a "name" set elsewhere survives)

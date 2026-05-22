@@ -31,10 +31,11 @@ A serial terminal opens in its own borderless window per device. Each remembers 
 - **Smart auto-scroll** — follows new data only when you're already at the bottom, so scrolling up to read holds your position.
 - **Connect / Disconnect** — toggle the connection from the title bar; the row's status reflects the live connection state.
 - **Reconnect on unplug** — optionally keeps the terminal open when the device is removed and reconnects automatically when it returns.
+- **Modem lines** — optional title-bar **RTS** / **DTR** buttons to drive those outputs (green = asserted), plus live **CTS** / **DSR** / **DCD** indicators. Choose *None*, *RTS/DTR* (controls only), or *Full* (controls + indicators) per device.
 - **Pin (📌)** — toggle the terminal's always-on-top independently of the main window.
 - **Clear** the output, or open the **⚙** port settings.
 - **Resizable** from any edge or corner; drag the title bar to move.
 
 ### Port settings
 
-Open the terminal's **⚙** to set **baud, data bits, parity, stop bits, line ending,** and **reconnect-on-unplug**. Settings are saved per device (VID:PID:serial) and applied immediately on save.
+Open the terminal's **⚙** to set **baud, data bits, parity, stop bits, line ending, signals** (None / RTS/DTR / Full), and **reconnect-on-unplug**. Settings are saved per device (VID:PID:serial) and applied immediately on save.
