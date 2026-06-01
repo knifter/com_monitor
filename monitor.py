@@ -115,7 +115,8 @@ DEFAULT_PORT_SETTINGS = {
     "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
     "reconnect_on_unplug": True,              # keep terminal open & reconnect when device returns
     "signals":     "controls",                # title-bar modem lines: "none" | "controls" | "full"
-    "watch_file":  "",                        # path to monitor (empty = disabled)
+    "watch_enable": False,                    # master toggle for the file watcher
+    "watch_file":  "",                        # path to monitor (also disabled when empty)
     "watch_reconnect_s": 5.0,                 # seconds to release the port after a change
 }
 
@@ -578,10 +579,14 @@ class ComMonitor(tk.Tk):
 
     def _on_status_click(self, device: Device):
         """Click on a row's status cell. Each device has its own terminal:
-        surface it if open, otherwise open now (if free) or queue the wait."""
+        surface it if open, otherwise open now (if free) or queue the wait.
+        If the terminal exists but is user-disconnected, the click also asks
+        it to reconnect — the row labelled 'free' should match the action."""
         if device.terminal is not None:
             device.terminal.lift()
             device.terminal.focus_set()
+            if device.conn_state == "disconnected":
+                device.terminal.reconnect()
             return
         if device.wanted:
             device.wanted = False                       # cancel wait
@@ -1440,12 +1445,16 @@ class Terminal(tk.Toplevel):
         self._watch_poll_id = None
         if self._closing:
             return
-        snap = self._watch_snapshot()
-        if not self._watch_path():
-            # path cleared (or never set) → drop the baseline so re-enabling
-            # the watch starts a fresh observation
+        ps = self.dev.port_settings()
+        enabled = bool(ps.get("watch_enable", False))
+        if not enabled or not self._watch_path():
+            # disabled (or no path) → drop baseline so a future enable starts
+            # a fresh observation rather than firing on the very first poll
             self._watch_baseline = None
-        elif snap is not None:
+            self._schedule_watch_poll()
+            return
+        snap = self._watch_snapshot()
+        if snap is not None:
             if self._watch_baseline is None:
                 self._watch_baseline = snap              # first observation
             elif snap != self._watch_baseline:
@@ -1464,27 +1473,34 @@ class Terminal(tk.Toplevel):
         except (TypeError, ValueError):
             timeout = 5.0
         timeout = max(0.0, min(20.0, timeout))
+        manual  = (timeout == 0.0)
+        suffix  = "reconnect manually" if manual else f"for {timeout:.1f} s"
 
         if self.state == "connected":
             self._close_serial()
             self._set_state("disconnected")
             self._watch_holding = True
-            self._info(f"[watch: file changed — releasing port for {timeout:.1f} s]")
+            self._info(f"[watch: file changed — releasing port; {suffix}]")
         elif self.state == "waiting":
             self._set_state("disconnected")
             self._watch_holding = True
-            self._info(f"[watch: file changed — holding off for {timeout:.1f} s]")
+            self._info(f"[watch: file changed — holding off; {suffix}]")
         elif self.state == "disconnected" and self._watch_holding:
-            self._info(f"[watch: file changed again — extending hold to {timeout:.1f} s]")
+            self._info("[watch: file changed again]" if manual
+                       else f"[watch: file changed again — extending hold to {timeout:.1f} s]")
         else:
             return                                       # user-disconnected: ignore
 
+        # Cancel any pending timer (handles the case where timeout was just
+        # lowered to 0, leaving an in-flight reconnect that we no longer want).
         if self._watch_release_id is not None:
             try:
                 self.after_cancel(self._watch_release_id)
             except tk.TclError:
                 pass
-        self._watch_release_id = self.after(int(timeout * 1000), self._watch_reconnect)
+            self._watch_release_id = None
+        if not manual:
+            self._watch_release_id = self.after(int(timeout * 1000), self._watch_reconnect)
 
     def _watch_reconnect(self):
         """Hold window elapsed — resume the connection. If the port is still
@@ -1850,11 +1866,21 @@ class PortSettingsDialog(tk.Toplevel):
                        font=FONT, anchor="w"
                        ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
-        # ── file watch: release the port when this file changes ────────────
-        label(7, "Watch file:")
+        # ── file watch: release the port when a chosen file changes ────────
+        self.var_watch_en = tk.BooleanVar(value=bool(s.get("watch_enable", False)))
+        tk.Checkbutton(frm, text="Watch file (change=disconnect)",
+                       variable=self.var_watch_en,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=7, column=0, columnspan=2, sticky="w", **pad)
+
+        tk.Label(frm, text="     ↳ path:",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=8, column=0, sticky="w", **pad)
         self.var_watch = tk.StringVar(value=s.get("watch_file", ""))
         watch_row = tk.Frame(frm, bg=C_BG)
-        watch_row.grid(row=7, column=1, sticky="we", **pad)
+        watch_row.grid(row=8, column=1, sticky="we", **pad)
         tk.Entry(watch_row, textvariable=self.var_watch, width=30,
                  bg=C_HDR, fg=C_PORT, font=FONT, bd=0, relief="flat",
                  insertbackground=C_PORT
@@ -1869,14 +1895,16 @@ class PortSettingsDialog(tk.Toplevel):
                   activebackground=C_HDR, activeforeground="white"
                   ).pack(side=tk.LEFT, padx=(2, 0))
 
-        label(8, "Reconnect after (s):")
+        tk.Label(frm, text="     ↳ reconnect after (s, 0 = manual):",
+                 bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
+                 ).grid(row=9, column=0, sticky="w", **pad)
         self.var_watch_to = tk.DoubleVar(value=float(s.get("watch_reconnect_s", 5.0)))
         tk.Spinbox(frm, from_=0, to=20, increment=0.1, format="%.1f",
                    textvariable=self.var_watch_to,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=8, column=1, sticky="w", **pad)
+                   ).grid(row=9, column=1, sticky="w", **pad)
 
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
@@ -1913,6 +1941,8 @@ class PortSettingsDialog(tk.Toplevel):
         try: new["reconnect_on_unplug"] = bool(self.var_reconn.get())
         except (tk.TclError, ValueError): pass
         try: new["signals"] = self.LABEL_TO_SIG.get(self.var_sig.get(), "none")
+        except (tk.TclError, ValueError): pass
+        try: new["watch_enable"] = bool(self.var_watch_en.get())
         except (tk.TclError, ValueError): pass
         try: new["watch_file"] = str(self.var_watch.get()).strip()
         except (tk.TclError, ValueError): pass
