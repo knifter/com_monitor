@@ -1369,15 +1369,19 @@ class Terminal(tk.Toplevel):
             self._rts = not self._rts
         else:
             self._dtr = not self._dtr
-        if self.serial is not None:
-            try:
-                if line == "rts":
-                    self.serial.rts = self._rts
-                else:
-                    self.serial.dtr = self._dtr
-            except (serial.SerialException, OSError):
-                pass
+        self._apply_modem_outputs()
         self._update_signal_widgets()
+
+    def _apply_modem_outputs(self):
+        """Drive RTS/DTR on the live port to our tracked state. No-op if the
+        port isn't open."""
+        if self.serial is None:
+            return
+        try:
+            self.serial.rts = self._rts
+            self.serial.dtr = self._dtr
+        except (serial.SerialException, OSError):
+            pass
 
     def _update_signal_widgets(self):
         """Repaint RTS/DTR from our tracked output state and CTS/DSR/DCD from the
@@ -1499,11 +1503,11 @@ class Terminal(tk.Toplevel):
                 parity=s["parity"],
                 stopbits=s["stop_bits"],
                 timeout=0)
-            try:                                        # apply our RTS/DTR state
-                self.serial.rts = self._rts
-                self.serial.dtr = self._dtr
-            except (serial.SerialException, OSError):
-                pass
+            # Drive RTS/DTR immediately, then again after 100 ms — some USB-serial
+            # adapters drop line-state commands issued in the first few ms after
+            # enumeration, so a second write ensures the buttons' values stick.
+            self._apply_modem_outputs()
+            self.after(100, self._apply_modem_outputs)
             self._info(f"[connected @ {s['baud']} "
                        f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
             self._update_signal_widgets()
