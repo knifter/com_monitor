@@ -1,0 +1,6 @@
+v1.4.0
+ - Feature: keep deleted ports in view indefinitely (optional)
+ - Feature: disconnect on file change
+ - fix: set RTS etc on re-connect
+ - fix: enable re-connect also when terminal is already open and press status, like terminal was closed
+ 
