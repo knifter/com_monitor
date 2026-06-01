@@ -86,7 +86,8 @@ SETTINGS_FILE = os.path.join(_APP_DIR, "com_monitor.json")
 
 DEFAULT_SETTINGS = {
     "highlight_duration_s":     20.0,         # row-flash fade duration
-    "show_removed_s":           60,           # 0 = don't show removed ports
+    "show_removed_enable":      True,         # show disconnected ports at all
+    "show_removed_s":           60,           # gated: 0 = keep forever this session, else seconds before purge
     "always_on_top":            True,         # pin the window above all others
     "always_on_top_timeout_s":  0,            # 0 = never drop; else drop after idle
     "interaction_timeout_s":    2,            # seconds with no mouse/focus before fading
@@ -748,13 +749,20 @@ class ComMonitor(tk.Tk):
 
         # expire/purge: drop records gone too long. Keep any device that still
         # has a terminal or a pending open, even once its row expires.
-        show_removed = self.settings["show_removed_s"]
+        # Semantics: checkbox off → drop immediately; checkbox on + 0 → keep for
+        # the rest of the session; checkbox on + N → drop after N seconds.
+        show_removed_en = self.settings["show_removed_enable"]
+        show_removed    = self.settings["show_removed_s"]
         for dev_id, d in list(self.devices.items()):
             if d.present or d.terminal is not None or d.wanted:
                 continue
-            expired = (d.disappeared_at is None
-                       or show_removed == 0
-                       or (now - d.disappeared_at) > show_removed)
+            if not show_removed_en:
+                expired = True
+            elif show_removed == 0:
+                expired = False
+            else:
+                expired = (d.disappeared_at is None
+                           or (now - d.disappeared_at) > show_removed)
             if expired:
                 del self.devices[dev_id]
 
@@ -840,9 +848,12 @@ class ComMonitor(tk.Tk):
         self._row_widgets.clear()
         self._empty_lbl.grid_forget()
 
+        # Hide removed ports if the checkbox is off; else show while either the
+        # session-forever (0) flag is set or the per-port window hasn't elapsed.
         visible = [d for d in self.devices.values()
-                   if d.present or (show_removed != 0
-                                    and now - d.disappeared_at <= show_removed)]
+                   if d.present or (show_removed_en
+                                    and (show_removed == 0
+                                         or now - d.disappeared_at <= show_removed))]
         visible.sort(key=lambda d: d.id)
         if not visible:
             self._empty_lbl.grid(row=0, column=0, columnspan=len(COLS),
@@ -1010,16 +1021,23 @@ class SettingsDialog(tk.Toplevel):
                    insertbackground=C_PORT
                    ).grid(row=0, column=1, sticky="w", **pad)
 
-        # Show removed ports for
-        tk.Label(frm, text="Show removed ports for (s, 0 = hide):",
+        # Show disconnected ports (checkbox), with an indented timeout below.
+        self.var_sr_en = tk.BooleanVar(value=s["show_removed_enable"])
+        tk.Checkbutton(frm, text="Show disconnected ports",
+                       variable=self.var_sr_en,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=1, column=0, columnspan=2, sticky="w", **pad)
+        tk.Label(frm, text="     ↳ remove after (s, 0 = never):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=1, column=0, sticky="w", **pad)
+                 ).grid(row=2, column=0, sticky="w", **pad)
         self.var_sr = tk.IntVar(value=s["show_removed_s"])
         tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_sr,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=1, column=1, sticky="w", **pad)
+                   ).grid(row=2, column=1, sticky="w", **pad)
 
         # Always on top
         self.var_aot = tk.BooleanVar(value=s["always_on_top"])
@@ -1028,16 +1046,16 @@ class SettingsDialog(tk.Toplevel):
                        bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
                        activebackground=C_BG, activeforeground=C_DESC,
                        font=FONT, anchor="w"
-                       ).grid(row=2, column=0, columnspan=2, sticky="w", **pad)
+                       ).grid(row=3, column=0, columnspan=2, sticky="w", **pad)
         tk.Label(frm, text="     ↳ drop after idle (s, 0 = never):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=3, column=0, sticky="w", **pad)
+                 ).grid(row=4, column=0, sticky="w", **pad)
         self.var_aot_to = tk.IntVar(value=s["always_on_top_timeout_s"])
         tk.Spinbox(frm, from_=0, to=86400, increment=10, textvariable=self.var_aot_to,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=3, column=1, sticky="w", **pad)
+                   ).grid(row=4, column=1, sticky="w", **pad)
 
         # Move to background on idle
         self.var_mtb = tk.BooleanVar(value=s["move_to_back_enable"])
@@ -1046,32 +1064,32 @@ class SettingsDialog(tk.Toplevel):
                        bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
                        activebackground=C_BG, activeforeground=C_DESC,
                        font=FONT, anchor="w"
-                       ).grid(row=4, column=0, columnspan=2, sticky="w", **pad)
+                       ).grid(row=5, column=0, columnspan=2, sticky="w", **pad)
         tk.Label(frm, text="     ↳ after (s):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=5, column=0, sticky="w", **pad)
+                 ).grid(row=6, column=0, sticky="w", **pad)
         self.var_mtb_to = tk.IntVar(value=s["move_to_back_timeout_s"])
         tk.Spinbox(frm, from_=1, to=86400, increment=10, textvariable=self.var_mtb_to,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=5, column=1, sticky="w", **pad)
+                   ).grid(row=6, column=1, sticky="w", **pad)
 
         # Interaction timeout (seconds before fade begins; 0 = fade at once)
         tk.Label(frm, text="Fade after no interaction (s, 0 = immediate):",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=6, column=0, sticky="w", **pad)
+                 ).grid(row=7, column=0, sticky="w", **pad)
         self.var_it = tk.IntVar(value=s["interaction_timeout_s"])
         tk.Spinbox(frm, from_=0, to=3600, increment=1, textvariable=self.var_it,
                    width=8, bg=C_HDR, fg=C_PORT, font=FONT,
                    buttonbackground=C_HDR, relief="flat",
                    insertbackground=C_PORT
-                   ).grid(row=6, column=1, sticky="w", **pad)
+                   ).grid(row=7, column=1, sticky="w", **pad)
 
         # Window transparency (rows keep this opacity; live preview)
         tk.Label(frm, text="Window transparency:",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=7, column=0, sticky="w", **pad)
+                 ).grid(row=8, column=0, sticky="w", **pad)
         self.var_an = tk.DoubleVar(value=s["normal_alpha"])
         tk.Scale(frm, from_=0.4, to=1.0, resolution=0.01,
                  orient=tk.HORIZONTAL, variable=self.var_an,
@@ -1079,12 +1097,12 @@ class SettingsDialog(tk.Toplevel):
                  bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
                  highlightthickness=0, bd=0, length=160,
                  font=FONT, activebackground=C_PORT,
-                 ).grid(row=7, column=1, sticky="w", **pad)
+                 ).grid(row=8, column=1, sticky="w", **pad)
 
         # Terminal transparency (applies to every open terminal; live preview)
         tk.Label(frm, text="Terminal transparency:",
                  bg=C_BG, fg=C_DESC, font=FONT, anchor="w"
-                 ).grid(row=8, column=0, sticky="w", **pad)
+                 ).grid(row=9, column=0, sticky="w", **pad)
         self.var_tan = tk.DoubleVar(value=s.get("terminal_alpha", ALPHA_OPAQUE))
         tk.Scale(frm, from_=0.4, to=1.0, resolution=0.01,
                  orient=tk.HORIZONTAL, variable=self.var_tan,
@@ -1092,7 +1110,7 @@ class SettingsDialog(tk.Toplevel):
                  bg=C_BG, fg=C_DESC, troughcolor=C_HDR,
                  highlightthickness=0, bd=0, length=160,
                  font=FONT, activebackground=C_PORT,
-                 ).grid(row=8, column=1, sticky="w", **pad)
+                 ).grid(row=9, column=1, sticky="w", **pad)
 
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
@@ -1136,6 +1154,7 @@ class SettingsDialog(tk.Toplevel):
                 s["highlight_duration_s"] = v
         except (tk.TclError, ValueError):
             pass
+        s["show_removed_enable"] = bool(self.var_sr_en.get())
         try:
             v = int(self.var_sr.get())
             if v >= 0:
