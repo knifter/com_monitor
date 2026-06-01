@@ -9,6 +9,7 @@ Needs:  pip install pyserial pywin32
 
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import filedialog
 import math
 import time
 import json
@@ -114,9 +115,12 @@ DEFAULT_PORT_SETTINGS = {
     "line_ending": "\r\n",                    # "\r\n" | "\n" | "\r" | ""
     "reconnect_on_unplug": True,              # keep terminal open & reconnect when device returns
     "signals":     "controls",                # title-bar modem lines: "none" | "controls" | "full"
+    "watch_file":  "",                        # path to monitor (empty = disabled)
+    "watch_reconnect_s": 5.0,                 # seconds to release the port after a change
 }
 
 TERM_POLL_MS  = 50                            # serial-read poll cadence
+TERM_WATCH_POLL_MS = 100                      # file-watch poll cadence
 TERM_BORDER   = 4                             # px resize-zone around the terminal
 TERM_MIN_W    = 280                           # minimum terminal width
 TERM_MIN_H    = 160                           # minimum terminal height
@@ -1211,6 +1215,14 @@ class Terminal(tk.Toplevel):
         self._sig_frame = None
         self._rts_btn = self._dtr_btn = None
         self._cts_lbl = self._dsr_lbl = self._dcd_lbl = None
+        # file-watch state. baseline is (exists, mtime, size) or None when no
+        # file is being watched / no observation yet; _watch_holding marks the
+        # release window after a detected change so the ComMonitor auto-reconnect
+        # machinery doesn't grab the port back during the flash.
+        self._watch_baseline = None
+        self._watch_poll_id = None
+        self._watch_release_id = None
+        self._watch_holding = False
 
         self.title(f"Terminal — {device.id}")
         self.configure(bg=C_HDR)                        # exposed margin = subtle border
@@ -1233,6 +1245,7 @@ class Terminal(tk.Toplevel):
             self._position_above_main()
         self._set_state("connected" if self._open_serial() else "waiting")
         self._schedule_poll()
+        self._schedule_watch_poll()
 
         self.bind("<Configure>", self._on_configure)
         self.focus_force()                              # override-redirect needs a nudge
@@ -1402,6 +1415,97 @@ class Terminal(tk.Toplevel):
         except (serial.SerialException, OSError):
             pass
 
+    # ── file watch: release the port and re-grab it after a build ──────────
+    def _watch_path(self) -> str:
+        return (self.dev.port_settings().get("watch_file") or "").strip()
+
+    def _watch_snapshot(self):
+        """(exists, mtime, size) for the watch file. None means no path set
+        OR the previous baseline should be kept (transient stat error)."""
+        p = self._watch_path()
+        if not p:
+            return None
+        try:
+            st = os.stat(p)
+            return (True, st.st_mtime, st.st_size)
+        except FileNotFoundError:
+            return (False, None, None)
+        except OSError:
+            return None                                  # transient: keep baseline
+
+    def _schedule_watch_poll(self):
+        self._watch_poll_id = self.after(TERM_WATCH_POLL_MS, self._watch_poll)
+
+    def _watch_poll(self):
+        self._watch_poll_id = None
+        if self._closing:
+            return
+        snap = self._watch_snapshot()
+        if not self._watch_path():
+            # path cleared (or never set) → drop the baseline so re-enabling
+            # the watch starts a fresh observation
+            self._watch_baseline = None
+        elif snap is not None:
+            if self._watch_baseline is None:
+                self._watch_baseline = snap              # first observation
+            elif snap != self._watch_baseline:
+                self._watch_baseline = snap
+                self._watch_trigger()
+        self._schedule_watch_poll()
+
+    def _watch_trigger(self):
+        """File changed. If we hold the port (or are actively waiting for it),
+        release and enter a hold window so the flasher can grab it; repeated
+        changes within the window restart the timer so we wait for the file
+        to settle before reconnecting. Ignored if the user has manually
+        disconnected."""
+        try:
+            timeout = float(self.dev.port_settings().get("watch_reconnect_s", 5.0))
+        except (TypeError, ValueError):
+            timeout = 5.0
+        timeout = max(0.0, min(20.0, timeout))
+
+        if self.state == "connected":
+            self._close_serial()
+            self._set_state("disconnected")
+            self._watch_holding = True
+            self._info(f"[watch: file changed — releasing port for {timeout:.1f} s]")
+        elif self.state == "waiting":
+            self._set_state("disconnected")
+            self._watch_holding = True
+            self._info(f"[watch: file changed — holding off for {timeout:.1f} s]")
+        elif self.state == "disconnected" and self._watch_holding:
+            self._info(f"[watch: file changed again — extending hold to {timeout:.1f} s]")
+        else:
+            return                                       # user-disconnected: ignore
+
+        if self._watch_release_id is not None:
+            try:
+                self.after_cancel(self._watch_release_id)
+            except tk.TclError:
+                pass
+        self._watch_release_id = self.after(int(timeout * 1000), self._watch_reconnect)
+
+    def _watch_reconnect(self):
+        """Hold window elapsed — resume the connection. If the port is still
+        busy, reconnect() falls back to 'waiting' which the main window's
+        port-free poll picks up."""
+        self._watch_release_id = None
+        if self._closing or not self._watch_holding:
+            return                                       # cancelled / overridden
+        self._watch_holding = False
+        self.reconnect()
+
+    def _watch_cancel_hold(self):
+        """Drop any pending watch-reconnect timer (manual user action wins)."""
+        if self._watch_release_id is not None:
+            try:
+                self.after_cancel(self._watch_release_id)
+            except tk.TclError:
+                pass
+            self._watch_release_id = None
+        self._watch_holding = False
+
     def _update_signal_widgets(self):
         """Repaint RTS/DTR from our tracked output state and CTS/DSR/DCD from the
         live port. Green = asserted/high, dim = low/deasserted."""
@@ -1441,6 +1545,8 @@ class Terminal(tk.Toplevel):
         self._update_conn_btn()
 
     def _toggle_connection(self):
+        # Manual user action wins over any watch hold in progress.
+        self._watch_cancel_hold()
         if self.state == "disconnected":
             # user wants a connection: take it now, else wait for the device
             self._set_state("connected" if self._open_serial() else "waiting")
@@ -1604,6 +1710,8 @@ class Terminal(tk.Toplevel):
     def reconnect(self):
         """Reopen the serial port with whatever port_settings are now in effect."""
         self._close_serial()
+        # The watch path/timeout may have just changed; re-seed on the next poll.
+        self._watch_baseline = None
         self._set_state("connected" if self._open_serial() else "waiting")
         self._refresh_title()
         self._build_signals()
@@ -1644,6 +1752,13 @@ class Terminal(tk.Toplevel):
             except tk.TclError:
                 pass
             self._poll_id = None
+        if self._watch_poll_id is not None:
+            try:
+                self.after_cancel(self._watch_poll_id)
+            except tk.TclError:
+                pass
+            self._watch_poll_id = None
+        self._watch_cancel_hold()
         self._close_serial()
         try:
             self.destroy()
@@ -1735,6 +1850,34 @@ class PortSettingsDialog(tk.Toplevel):
                        font=FONT, anchor="w"
                        ).grid(row=6, column=0, columnspan=2, sticky="w", **pad)
 
+        # ── file watch: release the port when this file changes ────────────
+        label(7, "Watch file:")
+        self.var_watch = tk.StringVar(value=s.get("watch_file", ""))
+        watch_row = tk.Frame(frm, bg=C_BG)
+        watch_row.grid(row=7, column=1, sticky="we", **pad)
+        tk.Entry(watch_row, textvariable=self.var_watch, width=30,
+                 bg=C_HDR, fg=C_PORT, font=FONT, bd=0, relief="flat",
+                 insertbackground=C_PORT
+                 ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(watch_row, text=" … ", command=self._browse_watch,
+                  bg=C_HDR, fg=C_DESC, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white"
+                  ).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Button(watch_row, text=" ✕ ",
+                  command=lambda: self.var_watch.set(""),
+                  bg=C_HDR, fg=C_DESC, bd=0, relief="flat", font=FONT,
+                  activebackground=C_HDR, activeforeground="white"
+                  ).pack(side=tk.LEFT, padx=(2, 0))
+
+        label(8, "Reconnect after (s):")
+        self.var_watch_to = tk.DoubleVar(value=float(s.get("watch_reconnect_s", 5.0)))
+        tk.Spinbox(frm, from_=0, to=20, increment=0.1, format="%.1f",
+                   textvariable=self.var_watch_to,
+                   width=8, bg=C_HDR, fg=C_PORT, font=FONT,
+                   buttonbackground=C_HDR, relief="flat",
+                   insertbackground=C_PORT
+                   ).grid(row=8, column=1, sticky="w", **pad)
+
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(0, 12))
         tk.Button(btns, text="Cancel", command=self.destroy,
@@ -1771,12 +1914,25 @@ class PortSettingsDialog(tk.Toplevel):
         except (tk.TclError, ValueError): pass
         try: new["signals"] = self.LABEL_TO_SIG.get(self.var_sig.get(), "none")
         except (tk.TclError, ValueError): pass
+        try: new["watch_file"] = str(self.var_watch.get()).strip()
+        except (tk.TclError, ValueError): pass
+        try:
+            v = float(self.var_watch_to.get())
+            new["watch_reconnect_s"] = max(0.0, min(20.0, v))
+        except (tk.TclError, ValueError): pass
 
         # merge serial keys into the device's entry (a "name" set elsewhere survives)
         self.terminal.dev.update_config(**new)
         save_settings(self.terminal.parent.settings)
         self.terminal.reconnect()
         self.destroy()
+
+    def _browse_watch(self):
+        path = filedialog.askopenfilename(parent=self,
+                                          title="Watch file",
+                                          initialfile=self.var_watch.get())
+        if path:
+            self.var_watch.set(path)
 
 
 if __name__ == "__main__":
