@@ -126,6 +126,12 @@ TERM_BORDER   = 4                             # px resize-zone around the termin
 TERM_MIN_W    = 280                           # minimum terminal width
 TERM_MIN_H    = 160                           # minimum terminal height
 
+# ESP/Arduino auto-reset timing (mirrors esptool). UART = external USB-serial
+# bridge (CH340/CP2102/…); USB = native USB-Serial-JTAG (ESP32-S2/S3/C3/…).
+ESP_RESET_DELAY_S     = 0.1                    # EN-low / inter-step hold
+ESP_BOOT_DELAY_S      = 0.05                   # GPIO0 hold after release (UART boot)
+ESP_USB_RESET_DELAY_S = 0.2                    # longer pulses for native-USB reset
+
 
 def load_settings() -> dict:
     # shallow-copy each default value so callers can mutate nested dicts
@@ -1356,7 +1362,8 @@ class Terminal(tk.Toplevel):
     # ── modem-control lines (title-bar buttons/indicators) ───────────────────
     def _signals_mode(self) -> str:
         m = self.dev.port_settings().get("signals", "none")
-        return m if m in ("none", "controls", "full") else "none"
+        return m if m in ("none", "controls", "full",
+                          "esptool", "esptool_usb") else "none"
 
     def _build_signals(self):
         """(Re)create the RTS/DTR controls and CTS/DSR/DCD indicators to match
@@ -1371,6 +1378,21 @@ class Terminal(tk.Toplevel):
 
         mode = self._signals_mode()
         if mode == "none":
+            return
+
+        if mode in ("esptool", "esptool_usb"):
+            # ESP/Arduino auto-reset: two buttons that pulse RTS/DTR to reboot
+            # into the user app or the ROM bootloader (download mode). The reset
+            # sequence differs per mode (UART bridge vs native USB-Serial-JTAG);
+            # see _esp_reset. No live line-state indicators here.
+            tk.Button(self._sig_frame, text=" app ", bg=C_HDR, fg=C_FREE, bd=0,
+                      relief="flat", font=("Segoe UI", 8),
+                      activebackground=C_HDR, activeforeground="white",
+                      command=lambda: self._esp_reset(False)).pack(side=tk.LEFT)
+            tk.Button(self._sig_frame, text=" boot ", bg=C_HDR, fg=C_VIDPID, bd=0,
+                      relief="flat", font=("Segoe UI", 8),
+                      activebackground=C_HDR, activeforeground="white",
+                      command=lambda: self._esp_reset(True)).pack(side=tk.LEFT)
             return
 
         # RTS / DTR — clickable outputs we drive
@@ -1417,6 +1439,100 @@ class Terminal(tk.Toplevel):
         try:
             self.serial.rts = self._rts
             self.serial.dtr = self._dtr
+        except (serial.SerialException, OSError):
+            pass
+
+    def _esp_reset(self, to_bootloader: bool):
+        """Reboot an ESP/Arduino board into the user app or the ROM bootloader
+        (download mode) by toggling RTS/DTR. Two strategies, picked by the
+        device's signals mode:
+
+        "esptool" (UART bridge — CH340/CP2102/…): the classic discrete-transistor
+            auto-reset where RTS drives EN/RESET and DTR drives GPIO0. Mirrors
+            esptool's ClassicReset / HardReset.
+
+        "esptool_usb" (native USB-Serial-JTAG — ESP32-S2/S3/C3/…): the chip's
+            built-in USB peripheral interprets the lines itself; the reset
+            transition is deliberately routed through (1,1) rather than (0,0),
+            and the chip re-enumerates (the COM port drops and returns) as part
+            of the reset, which is expected, not a failure. Mirrors esptool's
+            USBJTAGSerialReset / HardReset(uses_usb=True).
+
+        Every write goes through set_dtr/set_rts so the two-transfer ordering and
+        the Windows DTR-re-assert work-around match esptool on each edge."""
+        ser = self.serial
+        if ser is None:
+            self._info("[not connected — can't reset]")
+            return
+
+        usb = (self._signals_mode() == "esptool_usb")
+
+        def set_dtr(state: bool):
+            ser.dtr = state
+
+        def set_rts(state: bool):
+            # Some Windows USB-serial drivers (usbser.sys) drop DTR when RTS is
+            # changed, so re-assert the current DTR right after (esptool's fix).
+            ser.rts = state
+            ser.dtr = ser.dtr
+
+        try:
+            if usb:
+                if to_bootloader:
+                    # esptool USBJTAGSerialReset
+                    set_rts(False)
+                    set_dtr(False)                  # idle
+                    time.sleep(ESP_RESET_DELAY_S)
+                    set_dtr(True)                   # assert IO0 (boot)
+                    set_rts(False)
+                    time.sleep(ESP_RESET_DELAY_S)
+                    set_rts(True)                   # reset — routed through (1,1)
+                    set_dtr(False)
+                    set_rts(True)                   # re-set RTS so Windows propagates DTR
+                    time.sleep(ESP_RESET_DELAY_S)
+                    set_dtr(False)
+                    set_rts(False)                  # out of reset → enters ROM loader
+                    self._info("[USB reset → bootloader / download mode]")
+                else:
+                    # esptool HardReset(uses_usb=True) — pulse EN, IO0 left high
+                    set_dtr(False)                  # IO0 = HIGH (run, not boot)
+                    set_rts(True)                   # EN  = LOW
+                    time.sleep(ESP_USB_RESET_DELAY_S)
+                    set_rts(False)                  # EN  = HIGH → run the app
+                    time.sleep(ESP_USB_RESET_DELAY_S)
+                    self._info("[USB reset → app mode]")
+            if not usb:
+                if to_bootloader:
+                    # esptool ClassicReset
+                    set_dtr(False)                  # GPIO0 = HIGH
+                    set_rts(True)                   # EN    = LOW  (chip in reset)
+                    time.sleep(ESP_RESET_DELAY_S)
+                    set_dtr(True)                   # GPIO0 = LOW
+                    set_rts(False)                  # EN    = HIGH (released → ROM loader)
+                    time.sleep(ESP_BOOT_DELAY_S)
+                    set_dtr(False)                  # GPIO0 = HIGH (release)
+                    self._info("[reset → bootloader / download mode]")
+                else:
+                    # esptool HardReset — pulse EN with GPIO0 high
+                    set_dtr(False)                  # GPIO0 = HIGH (high before the pulse)
+                    set_rts(True)                   # EN    = LOW  (chip in reset)
+                    time.sleep(ESP_RESET_DELAY_S)
+                    set_rts(False)                  # EN    = HIGH (released → run app)
+                    self._info("[reset → app mode]")
+        except (serial.SerialException, OSError) as e:
+            # native USB drops & re-enumerates as part of the reset — expected;
+            # the main window's presence poll will reconnect when it returns
+            if usb:
+                self._info("[USB reset signal sent — device re-enumerating…]")
+            else:
+                self._info(f"[reset failed: {e}]")
+            return
+
+        # remember the resting line state (board running) so a later reconnect
+        # re-applies it rather than re-pulsing reset
+        try:
+            self._rts = bool(ser.rts)
+            self._dtr = bool(ser.dtr)
         except (serial.SerialException, OSError):
             pass
 
@@ -1791,7 +1907,8 @@ class PortSettingsDialog(tk.Toplevel):
     BAUDS = (4800, 9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600, 1000000, 2000000)
     LE_TO_LABEL = {"\r\n": "CRLF", "\n": "LF", "\r": "CR", "": "none"}
     LABEL_TO_LE = {v: k for k, v in LE_TO_LABEL.items()}
-    SIG_TO_LABEL = {"none": "None", "controls": "RTS/DTR", "full": "Full"}
+    SIG_TO_LABEL = {"none": "None", "controls": "RTS/DTR", "full": "Full",
+                    "esptool": "App/Boot UART", "esptool_usb": "App/Boot USB-JTAG"}
     LABEL_TO_SIG = {v: k for k, v in SIG_TO_LABEL.items()}
 
     def __init__(self, terminal: "Terminal"):
@@ -1854,9 +1971,15 @@ class PortSettingsDialog(tk.Toplevel):
              self.LE_TO_LABEL.get(s["line_ending"], "CRLF"))
 
         label(5, "Signals:")
-        self.var_sig = tk.StringVar()
-        spin(5, self.var_sig, tuple(self.SIG_TO_LABEL.values()),
-             self.SIG_TO_LABEL.get(s.get("signals", "none"), "None"))
+        self.var_sig = tk.StringVar(
+            value=self.SIG_TO_LABEL.get(s.get("signals", "none"), "None"))
+        sig_menu = tk.OptionMenu(frm, self.var_sig, *self.SIG_TO_LABEL.values())
+        sig_menu.configure(width=13, bg=C_HDR, fg=C_PORT, font=FONT,
+                           activebackground=C_HDR, activeforeground="white",
+                           highlightthickness=0, bd=0, relief="flat", anchor="w")
+        sig_menu["menu"].configure(bg=C_HDR, fg=C_PORT,
+                                   activebackground=C_PORT, activeforeground=C_BG)
+        sig_menu.grid(row=5, column=1, sticky="w", padx=8, pady=4)
 
         self.var_reconn = tk.BooleanVar(value=s["reconnect_on_unplug"])
         tk.Checkbutton(frm, text="Reconnect on unplug",
