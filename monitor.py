@@ -1398,9 +1398,14 @@ class Terminal(tk.Toplevel):
         self._poll_id = None
         self._closing = False
         self._conn_btn = None
-        # modem-control state: RTS/DTR are outputs we drive (default asserted),
-        # CTS/DSR/DCD are inputs we read. Widget refs are filled by _build_signals.
-        self._rts = self._dtr = True
+        # modem-control state: RTS/DTR are outputs we drive, CTS/DSR/DCD are
+        # inputs we read. Widget refs are filled by _build_signals. ESP auto-reset
+        # modes idle the lines de-asserted so merely opening or closing the port
+        # doesn't pulse the board into reset (a 1→0 drop on close is what the
+        # USB-Serial-JTAG reads as a reset); other modes keep the conventional
+        # asserted-on-open behaviour.
+        esp = self._signals_mode() in ("esptool", "esptool_usb")
+        self._rts = self._dtr = not esp
         self._sig_frame = None
         self._rts_btn = self._dtr_btn = None
         self._cts_lbl = self._dsr_lbl = self._dcd_lbl = None
