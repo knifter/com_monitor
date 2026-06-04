@@ -22,7 +22,7 @@ jobs:
         run: uv sync --locked --dev
 
       - name: Build exe
-        run: uv run pyinstaller --onefile --windowed --name com_monitor --icon icon.ico --add-data "icon.ico;." monitor.py
+        run: cmd /c build.cmd
 
       - name: Create release
         uses: softprops/action-gh-release@v2
