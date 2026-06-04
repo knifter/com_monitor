@@ -27,6 +27,119 @@ try:
 except ImportError:
     HAS_WIN32 = False
 
+# ── virtual-desktop confinement (Windows) ──────────────────────────────────
+# Borderless (override-redirect) windows carry no taskbar button, so Windows'
+# Virtual Desktop Manager never tracks them and shows them on *every* virtual
+# desktop. To confine the widget to one desktop it has to become trackable,
+# which means a taskbar button: we force WS_EX_APPWINDOW on the main strip and
+# make the rows window + terminals owned by it, so they follow its desktop
+# without buttons of their own. One taskbar button total.
+if sys.platform == "win32":
+    import ctypes
+    from ctypes import wintypes
+
+    _GWL_EXSTYLE      = -20
+    _GWLP_HWNDPARENT  = -8
+    _WS_EX_TOOLWINDOW = 0x00000080
+    _WS_EX_APPWINDOW  = 0x00040000
+    _GA_ROOT          = 2
+    _SW_HIDE          = 0
+    _SW_SHOWNA        = 8        # show, don't activate (keep focus where it is)
+    _WM_SETICON       = 0x0080
+    _ICON_SMALL       = 0
+    _ICON_BIG         = 1
+    _IMAGE_ICON       = 1
+    _LR_LOADFROMFILE  = 0x0010
+    _SM_CXICON        = 11
+    _SM_CYICON        = 12
+    _SM_CXSMICON      = 49
+    _SM_CYSMICON      = 50
+    _GCLP_HICON       = -14
+    _GCLP_HICONSM     = -34
+
+    _user32 = ctypes.windll.user32
+    _user32.GetAncestor.restype  = wintypes.HWND
+    _user32.GetAncestor.argtypes = (wintypes.HWND, ctypes.c_uint)
+    _user32.GetSystemMetrics.restype  = ctypes.c_int
+    _user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+    _user32.LoadImageW.restype  = ctypes.c_void_p
+    _user32.LoadImageW.argtypes = (ctypes.c_void_p, ctypes.c_wchar_p,
+                                   ctypes.c_uint, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint)
+    _user32.SendMessageW.restype  = ctypes.c_void_p
+    _user32.SendMessageW.argtypes = (wintypes.HWND, ctypes.c_uint,
+                                     ctypes.c_void_p, ctypes.c_void_p)
+
+    # 64-bit-safe long-ptr accessors (fall back to the 32-bit names on Win32)
+    _get_long = getattr(_user32, "GetWindowLongPtrW", _user32.GetWindowLongW)
+    _set_long = getattr(_user32, "SetWindowLongPtrW", _user32.SetWindowLongW)
+    _set_class_long = getattr(_user32, "SetClassLongPtrW", _user32.SetClassLongW)
+    for _f in (_get_long, _set_class_long):
+        _f.restype = ctypes.c_void_p
+    _get_long.argtypes = (wintypes.HWND, ctypes.c_int)
+    _set_long.restype  = ctypes.c_void_p
+    _set_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+    _set_class_long.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_void_p)
+
+    def _root_hwnd(hwnd):
+        return _user32.GetAncestor(hwnd, _GA_ROOT)
+
+    def make_taskbar_window(hwnd):
+        """Give a top-level window a taskbar button (clear TOOLWINDOW, set
+        APPWINDOW) so the Virtual Desktop Manager tracks it and keeps it on a
+        single desktop. The window is briefly hidden/reshown so the shell picks
+        up the change."""
+        h  = _root_hwnd(hwnd)
+        ex = (int(_get_long(h, _GWL_EXSTYLE) or 0)
+              & ~_WS_EX_TOOLWINDOW) | _WS_EX_APPWINDOW
+        _user32.ShowWindow(h, _SW_HIDE)
+        _set_long(h, _GWL_EXSTYLE, ex)
+        _user32.ShowWindow(h, _SW_SHOWNA)
+
+    def set_window_owner(hwnd, owner_hwnd):
+        """Make `hwnd` an owned window of `owner_hwnd`, so it has no taskbar
+        button of its own and follows the owner across virtual desktops."""
+        _set_long(_root_hwnd(hwnd), _GWLP_HWNDPARENT, _root_hwnd(owner_hwnd))
+
+    def set_window_icon(hwnd, ico_path):
+        """Load `ico_path` and attach it as the window's big + small icons (and
+        class icons), so the taskbar button shows it. Tk's iconbitmap sets the
+        window icon but the taskbar button created by WS_EX_APPWINDOW reads the
+        class icon, so push both explicitly."""
+        h = _root_hwnd(hwnd)
+        big = _user32.LoadImageW(None, ico_path, _IMAGE_ICON,
+                                 _user32.GetSystemMetrics(_SM_CXICON),
+                                 _user32.GetSystemMetrics(_SM_CYICON),
+                                 _LR_LOADFROMFILE)
+        small = _user32.LoadImageW(None, ico_path, _IMAGE_ICON,
+                                   _user32.GetSystemMetrics(_SM_CXSMICON),
+                                   _user32.GetSystemMetrics(_SM_CYSMICON),
+                                   _LR_LOADFROMFILE)
+        if big:
+            _user32.SendMessageW(h, _WM_SETICON, _ICON_BIG, big)
+            _set_class_long(h, _GCLP_HICON, big)
+        if small:
+            _user32.SendMessageW(h, _WM_SETICON, _ICON_SMALL, small)
+            _set_class_long(h, _GCLP_HICONSM, small)
+
+    # Give the process its own taskbar identity. Run via python.exe the button
+    # otherwise inherits the interpreter's AppUserModelID (and its icon),
+    # ignoring our per-window icon. Must happen before the first window appears.
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "com_monitor.widget")
+    except Exception:                                       # noqa: BLE001
+        pass
+else:
+    def make_taskbar_window(hwnd):
+        pass
+
+    def set_window_owner(hwnd, owner_hwnd):
+        pass
+
+    def set_window_icon(hwnd, ico_path):
+        pass
+
 # ── tunables ──────────────────────────────────────────────────────────────────
 REFRESH_MS      = 500
 NEW_DOT_S       = 8       # seconds the dot/age text stays yellow
@@ -85,12 +198,22 @@ else:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 SETTINGS_FILE = os.path.join(_APP_DIR, "com_monitor.json")
 
+
+def _resource_path(name: str) -> str:
+    """Path to a bundled read-only resource (e.g. icon.ico). In a PyInstaller
+    --onefile build data files live in the temp extraction dir (sys._MEIPASS);
+    from source they sit next to this script."""
+    base = getattr(sys, "_MEIPASS", _APP_DIR)
+    return os.path.join(base, name)
+
 DEFAULT_SETTINGS = {
     "highlight_duration_s":     20.0,         # row-flash fade duration
     "show_removed_enable":      True,         # show disconnected ports at all
     "show_removed_s":           60,           # gated: 0 = keep forever this session, else seconds before purge
     "always_on_top":            True,         # pin the window above all others
     "always_on_top_timeout_s":  0,            # 0 = never drop; else drop after idle
+    "show_on_all_desktops":     True,         # Windows: show on every virtual desktop
+                                              # (off = confine to one, adds a taskbar button)
     "interaction_timeout_s":    2,            # seconds with no mouse/focus before fading
     "move_to_back_enable":      False,        # push window to back of Z-order on idle
     "move_to_back_timeout_s":   300,
@@ -309,6 +432,13 @@ class ComMonitor(tk.Tk):
         super().__init__()
         self.settings = load_settings()
 
+        # app/window icon — drives the taskbar button when confined to a desktop.
+        # default=… applies it to every toplevel (terminals, dialogs) too.
+        try:
+            self.iconbitmap(default=_resource_path("icon.ico"))
+        except tk.TclError:
+            pass
+
         self.overrideredirect(True)
         self.attributes("-topmost", self.settings["always_on_top"])
         self.attributes("-alpha", self.settings["normal_alpha"])
@@ -344,6 +474,7 @@ class ComMonitor(tk.Tk):
         self._restore_window_position()
         self._sync_rows_geometry()
         self._rows_win.deiconify()                      # reveal once placed
+        self._apply_desktop_confinement()
 
     # ── layout ────────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -610,6 +741,7 @@ class ComMonitor(tk.Tk):
         try:
             device.terminal = Terminal(self, device)
             device.terminal.lift()
+            self._confine_window(device.terminal)
         except Exception as e:                          # noqa: BLE001
             print(f"Failed to open terminal for {device.id}: {e}")
             device.terminal = None
@@ -726,6 +858,40 @@ class ComMonitor(tk.Tk):
         self._top_active = self.settings["always_on_top"]
         self._update_alpha()
         self._update_terminal_alpha()
+        self._apply_desktop_confinement()
+
+    # ── virtual-desktop confinement ─────────────────────────────────────────
+    def _confine_to_desktop_enabled(self) -> bool:
+        return (sys.platform == "win32"
+                and not self.settings.get("show_on_all_desktops", True))
+
+    def _apply_desktop_confinement(self):
+        """If enabled (Windows), give the main strip a taskbar button so the
+        Virtual Desktop Manager keeps it on a single desktop, and make the rows
+        window + any open terminals owned by it so they follow along without
+        adding buttons of their own. Default off → borderless, no taskbar
+        button, shown on all desktops (unchanged). Takes effect on Save;
+        turning it back off needs a restart."""
+        if not self._confine_to_desktop_enabled():
+            return
+        make_taskbar_window(self.winfo_id())
+        set_window_icon(self.winfo_id(), _resource_path("icon.ico"))
+        set_window_owner(self._rows_win.winfo_id(), self.winfo_id())
+        for t in self._terminals():
+            try:
+                set_window_owner(t.winfo_id(), self.winfo_id())
+            except tk.TclError:
+                pass
+
+    def _confine_window(self, win):
+        """Make a newly-opened window (a terminal) owned by the main strip so it
+        shares its virtual desktop and adds no taskbar button of its own."""
+        if not self._confine_to_desktop_enabled():
+            return
+        try:
+            set_window_owner(win.winfo_id(), self.winfo_id())
+        except tk.TclError:
+            pass
 
     def _open_settings(self):
         SettingsDialog(self)
@@ -1127,6 +1293,17 @@ class SettingsDialog(tk.Toplevel):
                  font=FONT, activebackground=C_PORT,
                  ).grid(row=9, column=1, sticky="w", **pad)
 
+        # Show on all virtual desktops (Windows). Unchecking confines the widget
+        # to one desktop, which adds a single taskbar button. Takes effect on
+        # Save; re-enabling "all desktops" needs a restart.
+        self.var_ad = tk.BooleanVar(value=s.get("show_on_all_desktops", True))
+        tk.Checkbutton(frm, text="Show on all desktops (needs restart)",
+                       variable=self.var_ad,
+                       bg=C_BG, fg=C_DESC, selectcolor=C_HDR,
+                       activebackground=C_BG, activeforeground=C_DESC,
+                       font=FONT, anchor="w"
+                       ).grid(row=10, column=0, columnspan=2, sticky="w", **pad)
+
         # Buttons
         btns = tk.Frame(self, bg=C_BG)
         btns.pack(fill=tk.X, padx=12, pady=(6, 12))
@@ -1190,6 +1367,7 @@ class SettingsDialog(tk.Toplevel):
                 s["move_to_back_timeout_s"] = v
         except (tk.TclError, ValueError):
             pass
+        s["show_on_all_desktops"] = bool(self.var_ad.get())
         try:
             v = int(self.var_it.get())
             if v >= 0:
