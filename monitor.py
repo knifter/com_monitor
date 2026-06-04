@@ -122,14 +122,18 @@ if sys.platform == "win32":
             _user32.SendMessageW(h, _WM_SETICON, _ICON_SMALL, small)
             _set_class_long(h, _GCLP_HICONSM, small)
 
-    # Give the process its own taskbar identity. Run via python.exe the button
-    # otherwise inherits the interpreter's AppUserModelID (and its icon),
-    # ignoring our per-window icon. Must happen before the first window appears.
-    try:
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-            "com_monitor.widget")
-    except Exception:                                       # noqa: BLE001
-        pass
+    # Run via python.exe the taskbar button inherits the interpreter's
+    # AppUserModelID (and its icon), ignoring our per-window icon — so give the
+    # process its own identity. Skip this for the frozen .exe: there the exe is
+    # already its own identity with an embedded icon, and an explicit AppID with
+    # no relaunch/icon info would break the pinned-to-taskbar icon. Must happen
+    # before the first window appears.
+    if not getattr(sys, "frozen", False):
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "com_monitor.widget")
+        except Exception:                                   # noqa: BLE001
+            pass
 else:
     def make_taskbar_window(hwnd):
         pass
