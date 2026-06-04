@@ -1,3 +1,8 @@
+v1.5.0
+ - Terminal signals now has an ESP UART and ESP JTAG mode: reset into app, reset into bootmode that sequences the RTS/DTR signals correctly (for each type)
+ - Show On all desktops is now optional, configurable in settings (off requires taskbar button)
+ - Added an icon
+
 v1.4.0
  - Feature: keep deleted ports in view indefinitely (optional)
  - Feature: disconnect on file change
