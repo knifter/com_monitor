@@ -15,6 +15,7 @@ import time
 import json
 import os
 import sys
+import threading
 
 try:
     import serial.tools.list_ports
@@ -340,6 +341,67 @@ def is_open(device: str) -> bool:
     return _is_open_win32(device) if HAS_WIN32 else _is_open_fallback(device)
 
 
+# ── background open-probe ──────────────────────────────────────────────────────
+# is_open() opens a handle to the port, which on a malfunctioning device can
+# block inside the driver for up to ~30 s (a fixed usbser open timeout) before
+# returning. Doing that on the Tk UI thread freezes the whole app. PortProbe
+# runs is_open() on a worker thread instead and caches the answer for the UI to
+# read without ever blocking: at most one probe per port is in flight at a time
+# (so slow probes don't pile up every refresh), and while a probe is overdue the
+# port reads as "error" until it finally returns. The status therefore wiggles
+# free ↔ error on a flaky device, which is the intended, non-freezing behaviour.
+PROBE_STUCK_S = 1.5            # a probe outstanding longer than this reads "error"
+
+
+class PortProbe:
+    def __init__(self):
+        self._lock  = threading.Lock()
+        self._state: dict[str, dict] = {}     # port → {value,in_flight,started}
+
+    def status(self, port: str) -> str:
+        """Latest cached open-state for `port` as one of
+        "open" | "free" | "error" | "unknown", kicking a fresh background probe
+        if none is in flight. Never blocks the caller."""
+        now = time.time()
+        with self._lock:
+            st = self._state.get(port)
+            if st is None:
+                st = self._state[port] = {"value": None, "in_flight": False,
+                                          "started": 0.0}
+            in_flight = st["in_flight"]
+            value     = st["value"]
+            started   = st["started"]
+            if not in_flight:                          # spawn one, don't pile up
+                st["in_flight"] = True
+                st["started"]   = now
+        if not in_flight:
+            threading.Thread(target=self._run, args=(port,), daemon=True).start()
+            in_flight = True
+        if in_flight and value is None and (now - started) > PROBE_STUCK_S:
+            return "error"                             # first probe is stuck
+        if value is None:
+            return "unknown"
+        if in_flight and (now - started) > PROBE_STUCK_S:
+            return "error"                             # a refresh probe is stuck
+        return "open" if value else "free"
+
+    def _run(self, port: str):
+        try:
+            val = is_open(port)
+        except Exception:                              # noqa: BLE001
+            val = None
+        with self._lock:
+            st = self._state.get(port)
+            if st is not None:
+                st["value"]     = val
+                st["in_flight"] = False
+
+    def forget(self, port: str):
+        """Drop a port's cached state (call when its device record is purged)."""
+        with self._lock:
+            self._state.pop(port, None)
+
+
 # ── per-device record ─────────────────────────────────────────────────────────
 class Device:
     """One COM port currently or recently seen. Bundles its identity/data
@@ -449,6 +511,7 @@ class ComMonitor(tk.Tk):
         self.configure(bg=C_BG)
 
         self.devices: dict[str, Device] = {}          # COM id → Device (present or recently gone)
+        self._probe = PortProbe()                      # off-thread is_open cache
         self._initialized  = False                    # skip flash for ports present at startup
         self._row_widgets: list[list[tk.Widget]] = []
         self._drag_ox = self._drag_oy = 0
@@ -732,12 +795,13 @@ class ComMonitor(tk.Tk):
         if device.wanted:
             device.wanted = False                       # cancel wait
             return
-        # free and present right now → open immediately
-        if device.present and not is_open(device.id):
+        # Present → try to open now. The terminal's serial open is itself
+        # off-thread, so a busy/slow port won't freeze us: it falls back to
+        # "waiting" and the refresh loop grabs it once the cached probe says
+        # the port is free. Gone → queue and grab it when it returns free.
+        if device.present and self._probe.status(device.id) != "open":
             self._open_terminal(device)
             return
-        # OPEN (held elsewhere) or gone → queue and grab it as soon as it's
-        # present and free again
         device.wanted = True
 
     def _open_terminal(self, device: Device):
@@ -950,10 +1014,12 @@ class ComMonitor(tk.Tk):
                            or (now - d.disappeared_at) > show_removed)
             if expired:
                 del self.devices[dev_id]
+                self._probe.forget(dev_id)
 
         # ports queued to open: grab each as soon as it's present AND free
+        # (free per the cached background probe — never block the UI thread)
         for d in self.devices.values():
-            if d.wanted and d.present and not is_open(d.id):
+            if d.wanted and d.present and self._probe.status(d.id) == "free":
                 self._open_terminal(d)
 
         # reconcile each open terminal's connection with its device's presence
@@ -969,7 +1035,8 @@ class ComMonitor(tk.Tk):
                     t._info("[device removed — waiting for it to return]")
                 else:
                     t._close_quiet()
-            elif t.state == "waiting" and d.present and not is_open(d.id):
+            elif (t.state == "waiting" and d.present
+                  and self._probe.status(d.id) == "free"):
                 # device available again → reconnect (manual disconnect won't reach here)
                 t.reconnect()
 
@@ -1073,11 +1140,18 @@ class ComMonitor(tk.Tk):
                     age_s = now - d.first_seen
                     cs    = d.conn_state
                     # our terminal owns the port only while actually connected;
-                    # waiting/disconnected releases it so the row reflects that
-                    occupied = (cs == "connected"
-                                or (cs == "disconnected" and is_open(d.id)))
-                    waiting  = (cs == "waiting"
-                                or (cs == "disconnected" and d.wanted))
+                    # waiting/connecting/disconnected releases it so the row
+                    # reflects that. For a released port the OPEN/free state
+                    # comes from the cached background probe (never a blocking
+                    # is_open here); a probe stuck on a flaky device reads
+                    # "error" rather than freezing the UI.
+                    probe = (self._probe.status(d.id)
+                             if cs == "disconnected" and not d.wanted else None)
+                    occupied   = (cs == "connected" or probe == "open")
+                    waiting    = (cs == "waiting"
+                                  or (cs == "disconnected" and d.wanted))
+                    connecting = (cs == "connecting")
+                    errored    = (probe == "error")
 
                     flash_t = now - d.flash_start if d.flash_start is not None else None
                     if flash_t is not None:
@@ -1089,12 +1163,19 @@ class ComMonitor(tk.Tk):
                         row_font = FONT
 
                     fresh  = age_s < NEW_DOT_S
-                    dot_c  = C_NEW if fresh else (C_OPEN if occupied else C_FREE)
+                    dot_c  = C_NEW if fresh else (
+                        C_OPEN if occupied else
+                        C_GONE if errored else
+                        C_WAIT if (waiting or connecting) else C_FREE)
                     age_c  = C_NEW if fresh else C_AGE
-                    if waiting:
+                    if connecting:
+                        stat_t, stat_c = "connecting", C_WAIT
+                    elif waiting:
                         stat_t, stat_c = "waiting", C_WAIT
                     elif occupied:
                         stat_t, stat_c = "OPEN", C_OPEN
+                    elif errored:
+                        stat_t, stat_c = "error", C_GONE
                     else:
                         stat_t, stat_c = "free", C_FREE
                     port_c = C_PORT
@@ -1402,6 +1483,13 @@ class Terminal(tk.Toplevel):
         self._poll_id = None
         self._closing = False
         self._conn_btn = None
+        # async open: opening a serial port can block ~30 s in the driver on a
+        # malfunctioning device, so it runs on a worker thread. While the worker
+        # is out the state is "connecting"; it drops its result here for the
+        # 50 ms poll (on the UI thread) to pick up. _open_token guards against a
+        # stale worker's result landing after the user cancelled/reconnected.
+        self._open_result: "tuple | None" = None
+        self._open_token  = 0
         # modem-control state: RTS/DTR are outputs we drive, CTS/DSR/DCD are
         # inputs we read. Widget refs are filled by _build_signals. ESP auto-reset
         # modes idle the lines de-asserted so merely opening or closing the port
@@ -1441,7 +1529,7 @@ class Terminal(tk.Toplevel):
         self.update_idletasks()
         if not saved_geo:                                # first open → place above main
             self._position_above_main()
-        self._set_state("connected" if self._open_serial() else "waiting")
+        self._begin_open()                               # async; poll picks up result
         self._schedule_poll()
         self._schedule_watch_poll()
 
@@ -1867,10 +1955,13 @@ class Terminal(tk.Toplevel):
         # Manual user action wins over any watch hold in progress.
         self._watch_cancel_hold()
         if self.state == "disconnected":
-            # user wants a connection: take it now, else wait for the device
-            self._set_state("connected" if self._open_serial() else "waiting")
+            # user wants a connection: open asynchronously (→ "connecting", then
+            # the poll resolves it to connected/waiting without freezing the UI)
+            self._begin_open()
         else:
-            # connected or waiting → user opts out; no auto-reconnect
+            # connected / waiting / connecting → user opts out; no auto-reconnect.
+            # Bumping the token discards any in-flight open worker's result.
+            self._open_token += 1
             self._close_serial()
             self._set_state("disconnected")
             self._info("[disconnected]")
@@ -1881,6 +1972,7 @@ class Terminal(tk.Toplevel):
         # label = the action a click performs; colour = the current state
         text, fg = {
             "connected":    (" Disconnect ", C_FREE),
+            "connecting":   (" Cancel ",     C_WAIT),
             "waiting":      (" Cancel ",     C_WAIT),
             "disconnected": (" Connect ",    C_OPEN),
         }.get(self.state, (" Connect ", C_OPEN))
@@ -1937,29 +2029,50 @@ class Terminal(tk.Toplevel):
             y = y0 + (h0 - h)
         self.geometry(f"{w}x{h}+{x}+{y}")
 
-    def _open_serial(self) -> bool:
+    def _begin_open(self):
+        """Open the serial port on a worker thread so a slow/blocking driver
+        open (up to ~30 s on a malfunctioning device) never freezes the UI.
+        Sets state "connecting"; _poll picks up the worker's result and finishes
+        the connection (or falls back to "waiting") on the UI thread."""
+        if self.state == "connecting":
+            return                                       # one open in flight
+        s = dict(self.dev.port_settings())
+        self._open_token += 1
+        token = self._open_token
+        self._open_result = None
+        self._set_state("connecting")
+        self._info("[connecting…]")
+
+        def worker():
+            try:
+                ser = serial.Serial(
+                    self.dev.id,
+                    baudrate=s["baud"], bytesize=s["data_bits"],
+                    parity=s["parity"], stopbits=s["stop_bits"], timeout=0)
+                self._open_result = (token, ser, None)
+            except (serial.SerialException, OSError, ValueError) as e:
+                self._open_result = (token, None, e)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_open(self, ser, err):
+        """Apply a worker's open result on the UI thread."""
         s = self.dev.port_settings()
-        try:
-            self.serial = serial.Serial(
-                self.dev.id,
-                baudrate=s["baud"],
-                bytesize=s["data_bits"],
-                parity=s["parity"],
-                stopbits=s["stop_bits"],
-                timeout=0)
-            # Drive RTS/DTR immediately, then again after 100 ms — some USB-serial
-            # adapters drop line-state commands issued in the first few ms after
-            # enumeration, so a second write ensures the buttons' values stick.
-            self._apply_modem_outputs()
-            self.after(100, self._apply_modem_outputs)
-            self._info(f"[connected @ {s['baud']} "
-                       f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
-            self._update_signal_widgets()
-            return True
-        except (serial.SerialException, OSError, ValueError) as e:
+        if err is not None or ser is None:
             self.serial = None
-            self._info(f"[open failed: {e}]")
-            return False
+            self._info(f"[open failed: {err}]")
+            self._set_state("waiting")
+            return
+        self.serial = ser
+        # Drive RTS/DTR immediately, then again after 100 ms — some USB-serial
+        # adapters drop line-state commands issued in the first few ms after
+        # enumeration, so a second write ensures the buttons' values stick.
+        self._apply_modem_outputs()
+        self.after(100, self._apply_modem_outputs)
+        self._info(f"[connected @ {s['baud']} "
+                   f"{s['data_bits']}{s['parity']}{s['stop_bits']}]")
+        self._set_state("connected")
+        self._update_signal_widgets()
 
     def _close_serial(self):
         if self.serial is not None:
@@ -1976,6 +2089,20 @@ class Terminal(tk.Toplevel):
         self._poll_id = None
         if self._closing:
             return
+        # pick up an async open result (if any). Ignore a stale worker whose
+        # token no longer matches (user cancelled / reconnected meanwhile); if
+        # it managed to open the port, close that orphaned handle.
+        res = self._open_result
+        if res is not None:
+            self._open_result = None
+            token, ser, err = res
+            if token == self._open_token and self.state == "connecting":
+                self._finish_open(ser, err)
+            elif ser is not None:
+                try:
+                    ser.close()
+                except Exception:                        # noqa: BLE001
+                    pass
         if self.serial is not None:
             try:
                 n = self.serial.in_waiting
@@ -2027,11 +2154,14 @@ class Terminal(tk.Toplevel):
         PortSettingsDialog(self)
 
     def reconnect(self):
-        """Reopen the serial port with whatever port_settings are now in effect."""
+        """Reopen the serial port with whatever port_settings are now in effect.
+        The open is async (→ "connecting", resolved by the poll), so a slow
+        driver open can't freeze the UI here either."""
+        self._open_token += 1                            # discard any in-flight open
         self._close_serial()
         # The watch path/timeout may have just changed; re-seed on the next poll.
         self._watch_baseline = None
-        self._set_state("connected" if self._open_serial() else "waiting")
+        self._begin_open()
         self._refresh_title()
         self._build_signals()
 
@@ -2062,6 +2192,7 @@ class Terminal(tk.Toplevel):
         if self._closing:
             return
         self._closing = True
+        self._open_token += 1                           # orphan any in-flight open
         self.dev.conn_state = "disconnected"            # release the device's state
         self.dev.terminal = None                        # unbind from the device
         save_settings(self.parent.settings)             # persist geometry

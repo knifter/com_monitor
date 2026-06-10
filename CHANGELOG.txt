@@ -1,3 +1,7 @@
+v1.6.0
+ - Probing is done in separate background thread, prevents gui from hanging on faulty device
+ - Terminal is also in a separate thread. prevent gui from hanging when opening terminal on faulty device
+
 v1.5.1
  - Taskbar button fix when pinned
 
